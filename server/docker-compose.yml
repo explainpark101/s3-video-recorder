@@ -5,3 +5,5 @@ services:
       - "10397:3030"
     environment:
       - PORT=3030
+    volumes:
+      - ./stream-output:/stream-output:rw
