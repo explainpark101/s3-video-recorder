@@ -43,8 +43,13 @@ const App = () => {
     uploadId: null,
     key: null,
     parts: [],
-    partNumber: 1
+    partNumber: 1,
+    buffer: [],
+    bufferSize: 0,
+    uploadPromises: [],
   });
+
+  const MIN_PART_SIZE = 5 * 1024 * 1024; // S3 최소 5MB (마지막 파트 제외)
 
   // --- Crypto Helpers (Web Crypto API) ---
   const deriveKey = async (password, salt) => {
@@ -185,27 +190,45 @@ const App = () => {
       const fileName = `${getFormattedDate()}.webm`;
       setSavedKey(fileName);
       const { UploadId } = await initMultipartUpload(fileName);
-      uploadStateRef.current = { uploadId: UploadId, key: fileName, parts: [], partNumber: 1 };
+      uploadStateRef.current = { uploadId: UploadId, key: fileName, parts: [], partNumber: 1, buffer: [], bufferSize: 0, uploadPromises: [] };
       const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const combinedStream = new MediaStream([...screenStream.getVideoTracks(), ...micStream.getAudioTracks()]);
       if (videoPreviewRef.current) videoPreviewRef.current.srcObject = combinedStream;
       const recorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm; codecs=vp9,opus' });
+      const flushBuffer = async (isLastPart = false) => {
+        const state = uploadStateRef.current;
+        if (state.buffer.length === 0) return;
+        const totalSize = state.buffer.reduce((s, c) => s + c.byteLength, 0);
+        if (!isLastPart && totalSize < MIN_PART_SIZE) return;
+        const chunks = state.buffer;
+        state.buffer = [];
+        state.bufferSize = 0;
+        const num = state.partNumber++;
+        setUploadProgress(prev => ({ ...prev, currentPart: num }));
+        const combined = new Uint8Array(totalSize);
+        let offset = 0;
+        for (const c of chunks) { combined.set(new Uint8Array(c), offset); offset += c.byteLength; }
+        const p = uploadPart(combined, num, state.uploadId, state.key)
+          .then(({ ETag }) => { state.parts.push({ ETag, PartNumber: num }); setUploadProgress(prev => ({ ...prev, totalSent: prev.totalSent + combined.byteLength })); })
+          .catch((err) => setError(`업로드 실패: ${err.message}`));
+        state.uploadPromises.push(p);
+      };
+
       recorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
-          const num = uploadStateRef.current.partNumber++;
-          setUploadProgress(prev => ({ ...prev, currentPart: num }));
-          try {
-            const { ETag } = await uploadPart(event.data, num, uploadStateRef.current.uploadId, uploadStateRef.current.key);
-            uploadStateRef.current.parts.push({ ETag, PartNumber: num });
-            setUploadProgress(prev => ({ ...prev, totalSent: prev.totalSent + event.data.size }));
-          } catch (err) { setError(`업로드 실패: ${err.message}`); }
+          const state = uploadStateRef.current;
+          state.buffer.push(await event.data.arrayBuffer());
+          state.bufferSize += event.data.size;
+          if (state.bufferSize >= MIN_PART_SIZE) await flushBuffer(false);
         }
       };
       recorder.onstop = async () => {
         setRecordingStatus('processing');
         combinedStream.getTracks().forEach(t => t.stop());
         try {
+          await flushBuffer(true);
+          await Promise.all(uploadStateRef.current.uploadPromises);
           await completeUpload(uploadStateRef.current.uploadId, uploadStateRef.current.key, uploadStateRef.current.parts.sort((a, b) => a.PartNumber - b.PartNumber));
           setRecordingStatus('success');
         } catch (err) { setError("최종 저장 실패"); setRecordingStatus('idle'); }
