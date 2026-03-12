@@ -1,5 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Camera, Mic, StopCircle, Settings, CheckCircle, AlertCircle, Play, Radio, MonitorPlay, Eye, Download, RefreshCw, FileVideo, Upload, Lock, Unlock, X, Share, CircleArrowOutDownLeft } from 'lucide-react';
+import { Camera, Mic, StopCircle, Settings, CheckCircle, AlertCircle, Play, Radio, MonitorPlay, Eye, Download, RefreshCw, FileVideo, Lock, Unlock, X, Share, CircleArrowOutDownLeft } from 'lucide-react';
+import {
+  S3Client,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  ListObjectsV2Command,
+  GetObjectCommand,
+} from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const App = () => {
   const [currentView, setCurrentView] = useState('broadcast');
@@ -36,16 +45,6 @@ const App = () => {
     parts: [],
     partNumber: 1
   });
-
-  useEffect(() => {
-    const script = document.createElement('script');
-    script.src = "https://sdk.amazonaws.com/js/v2/1448.0.0/aws-sdk.min.js";
-    script.async = true;
-    document.body.appendChild(script);
-    return () => {
-      document.body.removeChild(script);
-    };
-  }, []);
 
   // --- Crypto Helpers (Web Crypto API) ---
   const deriveKey = async (password, salt) => {
@@ -126,17 +125,17 @@ const App = () => {
   };
 
   // --- S3 Logics ---
-  const getS3Instance = () => {
-    const AWS = window.AWS;
+  const getS3Client = () => {
     const config = {
-      accessKeyId: s3Config.accessKeyId,
-      secretAccessKey: s3Config.secretAccessKey,
       region: s3Config.region,
-      s3ForcePathStyle: true,
+      credentials: {
+        accessKeyId: s3Config.accessKeyId,
+        secretAccessKey: s3Config.secretAccessKey,
+      },
+      forcePathStyle: true,
     };
-    if (s3Config.endpoint) config.endpoint = new AWS.Endpoint(s3Config.endpoint);
-    AWS.config.update(config);
-    return new AWS.S3();
+    if (s3Config.endpoint) config.endpoint = s3Config.endpoint;
+    return new S3Client(config);
   };
 
   const getFormattedDate = () => {
@@ -146,18 +145,34 @@ const App = () => {
   };
 
   const initMultipartUpload = async (fileName) => {
-    const s3 = getS3Instance();
-    return await s3.createMultipartUpload({ Bucket: s3Config.bucketName, Key: fileName, ContentType: 'video/webm' }).promise();
+    const client = getS3Client();
+    const res = await client.send(new CreateMultipartUploadCommand({
+      Bucket: s3Config.bucketName,
+      Key: fileName,
+      ContentType: 'video/webm',
+    }));
+    return res;
   };
 
   const uploadPart = async (chunk, partNumber, uploadId, key) => {
-    const s3 = getS3Instance();
-    return await s3.uploadPart({ Body: chunk, Bucket: s3Config.bucketName, Key: key, PartNumber: partNumber, UploadId: uploadId }).promise();
+    const client = getS3Client();
+    return await client.send(new UploadPartCommand({
+      Body: chunk,
+      Bucket: s3Config.bucketName,
+      Key: key,
+      PartNumber: partNumber,
+      UploadId: uploadId,
+    }));
   };
 
   const completeUpload = async (uploadId, key, parts) => {
-    const s3 = getS3Instance();
-    return await s3.completeMultipartUpload({ Bucket: s3Config.bucketName, Key: key, MultipartUpload: { Parts: parts }, UploadId: uploadId }).promise();
+    const client = getS3Client();
+    return await client.send(new CompleteMultipartUploadCommand({
+      Bucket: s3Config.bucketName,
+      Key: key,
+      MultipartUpload: { Parts: parts },
+      UploadId: uploadId,
+    }));
   };
 
   const startStreaming = async () => {
@@ -210,19 +225,21 @@ const App = () => {
     if (!s3Config.bucketName || !s3Config.accessKeyId || !s3Config.secretAccessKey) return;
     setIsLoadingList(true);
     try {
-      const s3 = getS3Instance();
-      const data = await s3.listObjectsV2({ Bucket: s3Config.bucketName }).promise();
+      const client = getS3Client();
+      const data = await client.send(new ListObjectsV2Command({ Bucket: s3Config.bucketName }));
       setFileList((data.Contents || []).sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified)));
     } catch (err) { setError("목록 조회 실패"); } finally { setIsLoadingList(false); }
   };
 
-  const getFileUrl = (key, download = false) => {
+  const getFileUrl = async (key, download = false) => {
     try {
-      const s3 = getS3Instance();
-      return s3.getSignedUrl('getObject', {
-        Bucket: s3Config.bucketName, Key: key, Expires: 3600,
-        ResponseContentDisposition: download ? `attachment; filename="${key}"` : 'inline'
+      const client = getS3Client();
+      const command = new GetObjectCommand({
+        Bucket: s3Config.bucketName,
+        Key: key,
+        ResponseContentDisposition: download ? `attachment; filename="${key}"` : 'inline',
       });
+      return await getSignedUrl(client, command, { expiresIn: 3600 });
     } catch (err) { return ""; }
   };
 
@@ -364,7 +381,7 @@ const App = () => {
                     <FileVideo className="text-blue-500" />
                     <div><p className="text-sm font-bold truncate max-w-xs">{activePlayKey}</p><p className="text-[10px] text-slate-500 uppercase tracking-widest">Now Playing</p></div>
                   </div>
-                  <button onClick={() => { const url = getFileUrl(activePlayKey, true); window.open(url); }} className="bg-slate-800 hover:bg-slate-700 p-2 rounded-lg transition-colors"><Download size={20} /></button>
+                  <button onClick={async () => { const url = await getFileUrl(activePlayKey, true); if (url) window.open(url); }} className="bg-slate-800 hover:bg-slate-700 p-2 rounded-lg transition-colors"><Download size={20} /></button>
                 </div>
               )}
             </div>
@@ -383,8 +400,8 @@ const App = () => {
                           <div className="flex items-center justify-between">
                             <span className="text-[10px] text-slate-500">{(file.Size / 1024 / 1024).toFixed(2)} MB</span>
                             <div className="flex gap-2">
-                              <button onClick={() => { const url = getFileUrl(file.Key); setViewUrl(url); setActivePlayKey(file.Key); }} className="text-[10px] font-bold bg-blue-600/20 text-blue-400 px-2 py-1 rounded hover:bg-blue-600 hover:text-white transition-all">재생</button>
-                              <button onClick={() => { const url = getFileUrl(file.Key, true); window.open(url); }} className="text-[10px] font-bold bg-slate-800 text-slate-400 px-2 py-1 rounded hover:bg-slate-700 hover:text-white transition-all">다운로드</button>
+                              <button onClick={async () => { const url = await getFileUrl(file.Key); if (url) { setViewUrl(url); setActivePlayKey(file.Key); } }} className="text-[10px] font-bold bg-blue-600/20 text-blue-400 px-2 py-1 rounded hover:bg-blue-600 hover:text-white transition-all">재생</button>
+                              <button onClick={async () => { const url = await getFileUrl(file.Key, true); if (url) window.open(url); }} className="text-[10px] font-bold bg-slate-800 text-slate-400 px-2 py-1 rounded hover:bg-slate-700 hover:text-white transition-all">다운로드</button>
                             </div>
                           </div>
                         </div>
