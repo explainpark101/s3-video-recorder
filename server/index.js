@@ -77,109 +77,150 @@ const VIEWER_HTML = `<!DOCTYPE html>
 </html>`;
 
 const server = createServer((req, res) => {
-  const url = req.url === '/' ? '/index.html' : req.url;
-  if (url === '/index.html' || url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(VIEWER_HTML);
-    return;
-  }
-  if (url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'stream-host' }));
-    return;
-  }
-  if (url === '/stream.m3u8' || url.startsWith('/stream_') && url.endsWith('.ts')) {
-    const filePath = join(STREAM_DIR, url.slice(1));
-    if (!existsSync(filePath)) {
-      res.writeHead(404);
-      res.end();
+  try {
+    const url = req.url === '/' ? '/index.html' : req.url;
+    if (url === '/index.html' || url === '/') {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(VIEWER_HTML);
       return;
     }
-    const content = readFileSync(filePath);
-    const contentType = url.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T';
-    res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-cache' });
-    res.end(content);
-    return;
+    if (url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', service: 'stream-host' }));
+      return;
+    }
+    if (url === '/stream.m3u8' || (url.startsWith('/stream_') && url.endsWith('.ts'))) {
+      const filePath = join(STREAM_DIR, url.slice(1));
+      if (!existsSync(filePath)) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      const content = readFileSync(filePath);
+      const contentType = url.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T';
+      res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-cache' });
+      res.end(content);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  } catch (err) {
+    console.error('HTTP handler error:', err);
+    try {
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+      }
+      res.end(JSON.stringify({ error: 'internal_server_error' }));
+    } catch {
+      // ignore secondary errors
+    }
   }
-  res.writeHead(404);
-  res.end();
 });
 
 const wss = new WebSocketServer({ server });
+
+function safeWsSend(ws, payload) {
+  try {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(payload));
+    }
+  } catch (err) {
+    console.error('WebSocket send error:', err);
+  }
+}
 
 wss.on('connection', (ws) => {
   let ffmpegProcess = null;
   let isInitialized = false;
 
   ws.on('message', (data, isBinary) => {
-    if (!isBinary) {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'start' || msg.start) {
-          startFfmpeg();
-          isInitialized = true;
-          ws.send(JSON.stringify({ ok: true, message: 'Stream started', viewerUrl: `http://localhost:${PORT}/` }));
-        }
-      } catch {
-        ws.send(JSON.stringify({ error: 'Invalid init message' }));
-      }
-      return;
-    }
-
-    if (!isInitialized || !ffmpegProcess || !ffmpegProcess.stdin.writable) return;
-
-    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
     try {
-      ffmpegProcess.stdin.write(buf);
-    } catch (err) {
-      console.error('ffmpeg stdin write error:', err.message);
+      if (!isBinary) {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'start' || msg.start) {
+            startFfmpeg().catch((err) => {
+              console.error('startFfmpeg error:', err);
+              safeWsSend(ws, { error: 'failed_to_start_ffmpeg' });
+            });
+            isInitialized = true;
+            safeWsSend(ws, { ok: true, message: 'Stream started', viewerUrl: `http://localhost:${PORT}/` });
+          }
+        } catch {
+          safeWsSend(ws, { error: 'Invalid init message' });
+        }
+        return;
+      }
+
+      if (!isInitialized || !ffmpegProcess || !ffmpegProcess.stdin.writable) return;
+
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      try {
+        const canWrite = ffmpegProcess.stdin.write(buf);
+        if (!canWrite) {
+          console.warn('ffmpeg stdin backpressure: pausing WebSocket temporarily');
+        }
+      } catch (err) {
+        console.error('ffmpeg stdin write error:', err.message);
+      }
+    } catch (outerErr) {
+      console.error('WebSocket message handler error:', outerErr);
+      safeWsSend(ws, { error: 'internal_stream_error' });
     }
   });
 
   async function startFfmpeg() {
-    if (ffmpegProcess) {
-      try {
-        ffmpegProcess.stdin.end();
-        ffmpegProcess.kill('SIGTERM');
-      } catch {}
+    try {
+      if (ffmpegProcess) {
+        try {
+          ffmpegProcess.stdin.end();
+          ffmpegProcess.kill('SIGTERM');
+        } catch {
+          // ignore
+        }
+      }
+
+      const { spawn } = await import('child_process');
+      const outputPath = join(STREAM_DIR, 'stream.m3u8');
+      ffmpegProcess = spawn('ffmpeg', [
+        '-i', 'pipe:0',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-tune', 'zerolatency',
+        '-c:a', 'aac',
+        '-f', 'hls',
+        '-hls_time', '2',
+        '-hls_list_size', '5',
+        '-hls_flags', 'delete_segments+append_list',
+        '-hls_segment_filename', join(STREAM_DIR, 'stream_%03d.ts'),
+        outputPath,
+      ], {
+        stdio: ['pipe', 'ignore', 'pipe'],
+      });
+
+      ffmpegProcess.stderr.on('data', (chunk) => {
+        const str = chunk.toString();
+        if (str.includes('Error') || str.includes('error')) {
+          console.error('[ffmpeg]', str);
+        }
+      });
+
+      ffmpegProcess.on('error', (err) => {
+        console.error('ffmpeg spawn error:', err.message);
+        safeWsSend(ws, { error: `ffmpeg error: ${err.message}` });
+      });
+
+      ffmpegProcess.on('close', (code, signal) => {
+        ffmpegProcess = null;
+        if (code !== 0 && code !== null) {
+          console.log('[ffmpeg] exited with code', code);
+        }
+      });
+    } catch (err) {
+      console.error('startFfmpeg fatal error:', err);
+      safeWsSend(ws, { error: 'ffmpeg_start_failed' });
+      throw err;
     }
-
-    const { spawn } = await import('child_process');
-    const outputPath = join(STREAM_DIR, 'stream.m3u8');
-    ffmpegProcess = spawn('ffmpeg', [
-      '-i', 'pipe:0',
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-tune', 'zerolatency',
-      '-c:a', 'aac',
-      '-f', 'hls',
-      '-hls_time', '2',
-      '-hls_list_size', '5',
-      '-hls_flags', 'delete_segments+append_list',
-      '-hls_segment_filename', join(STREAM_DIR, 'stream_%03d.ts'),
-      outputPath,
-    ], {
-      stdio: ['pipe', 'ignore', 'pipe'],
-    });
-
-    ffmpegProcess.stderr.on('data', (chunk) => {
-      const str = chunk.toString();
-      if (str.includes('Error') || str.includes('error')) {
-        console.error('[ffmpeg]', str);
-      }
-    });
-
-    ffmpegProcess.on('error', (err) => {
-      console.error('ffmpeg spawn error:', err.message);
-      ws.send(JSON.stringify({ error: `ffmpeg error: ${err.message}` }));
-    });
-
-    ffmpegProcess.on('close', (code, signal) => {
-      ffmpegProcess = null;
-      if (code !== 0 && code !== null) {
-        console.log('[ffmpeg] exited with code', code);
-      }
-    });
   }
 
   ws.on('close', () => {
