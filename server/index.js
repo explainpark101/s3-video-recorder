@@ -119,6 +119,9 @@ const server = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
+// 단일 스트리머 강제용 전역 상태
+let activeStreamer = null;
+
 function safeWsSend(ws, payload) {
   try {
     if (ws.readyState === ws.OPEN) {
@@ -132,6 +135,55 @@ function safeWsSend(ws, payload) {
 wss.on('connection', (ws) => {
   let ffmpegProcess = null;
   let isInitialized = false;
+  let inactivityTimer = null;
+  let lastChunkAt = null;
+
+  function clearInactivityWatch() {
+    if (inactivityTimer) {
+      clearInterval(inactivityTimer);
+      inactivityTimer = null;
+    }
+  }
+
+  function startInactivityWatch() {
+    clearInactivityWatch();
+    lastChunkAt = Date.now();
+    const INACTIVITY_LIMIT_MS = 2 * 60 * 1000; // 2분
+    inactivityTimer = setInterval(() => {
+      if (!lastChunkAt) return;
+      const diff = Date.now() - lastChunkAt;
+      if (diff >= INACTIVITY_LIMIT_MS) {
+        stopStream('inactivity_timeout');
+      }
+    }, 10_000);
+  }
+
+  function stopStream(reason = 'stopped') {
+    clearInactivityWatch();
+
+    if (ffmpegProcess) {
+      try {
+        ffmpegProcess.stdin.end();
+      } catch {}
+      try {
+        ffmpegProcess.kill('SIGTERM');
+      } catch {}
+      ffmpegProcess = null;
+    }
+
+    if (activeStreamer === ws) {
+      activeStreamer = null;
+    }
+
+    try {
+      if (ws.readyState === ws.OPEN) {
+        safeWsSend(ws, { type: 'stream_closed', reason });
+        ws.close(1000);
+      }
+    } catch {
+      // ignore
+    }
+  }
 
   ws.on('message', (data, isBinary) => {
     try {
@@ -139,12 +191,29 @@ wss.on('connection', (ws) => {
         try {
           const msg = JSON.parse(data.toString());
           if (msg.type === 'start' || msg.start) {
+            // 이미 다른 스트리머가 방송 중이면 거부
+            if (activeStreamer && activeStreamer !== ws && activeStreamer.readyState === ws.OPEN) {
+              safeWsSend(ws, { error: 'stream_already_running' });
+              return;
+            }
+            if (isInitialized) {
+              safeWsSend(ws, { error: 'stream_already_initialized' });
+              return;
+            }
+
             startFfmpeg().catch((err) => {
               console.error('startFfmpeg error:', err);
               safeWsSend(ws, { error: 'failed_to_start_ffmpeg' });
             });
             isInitialized = true;
+            activeStreamer = ws;
+            startInactivityWatch();
             safeWsSend(ws, { ok: true, message: 'Stream started', viewerUrl: `http://localhost:${PORT}/` });
+            return;
+          }
+
+          if (msg.type === 'close' || msg.stop) {
+            stopStream('close_request');
           }
         } catch {
           safeWsSend(ws, { error: 'Invalid init message' });
@@ -152,10 +221,14 @@ wss.on('connection', (ws) => {
         return;
       }
 
+      // 단일 스트리머가 아닐 경우 스트림 데이터 무시
+      if (activeStreamer && activeStreamer !== ws) return;
+
       if (!isInitialized || !ffmpegProcess || !ffmpegProcess.stdin.writable) return;
 
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
       try {
+        lastChunkAt = Date.now();
         const canWrite = ffmpegProcess.stdin.write(buf);
         if (!canWrite) {
           console.warn('ffmpeg stdin backpressure: pausing WebSocket temporarily');
@@ -224,13 +297,7 @@ wss.on('connection', (ws) => {
   }
 
   ws.on('close', () => {
-    if (ffmpegProcess) {
-      try {
-        ffmpegProcess.stdin.end();
-        ffmpegProcess.kill('SIGTERM');
-      } catch {}
-      ffmpegProcess = null;
-    }
+    stopStream('ws_closed');
   });
 });
 
