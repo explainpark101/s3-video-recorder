@@ -19,6 +19,7 @@ const App = () => {
   const [savedKey, setSavedKey] = useState("");
   const [liveStreamReady, setLiveStreamReady] = useState(false);
   const [viewerUrl, setViewerUrl] = useState('');
+  const [liveStreamError, setLiveStreamError] = useState(null);
 
   // S3 연결 정보는 오직 useState(In-Memory)에만 저장됩니다.
   // localStorage나 indexedDB를 사용하지 않으므로 탭 종료 시 자동 삭제됩니다.
@@ -43,6 +44,9 @@ const App = () => {
   const mediaRecorderRef = useRef(null);
   const videoPreviewRef = useRef(null);
   const streamWsRef = useRef(null);
+  const streamWsRetryTimerRef = useRef(null);
+  const streamRetryActiveRef = useRef(false);
+  const pendingWsSendsRef = useRef(Promise.resolve());
   const uploadStateRef = useRef({
     uploadId: null,
     key: null,
@@ -116,7 +120,15 @@ const App = () => {
 
       const decoded = new TextDecoder().decode(decrypted);
       const parsed = JSON.parse(decoded);
-      setS3Config({ streamServerUrl: 'ws://localhost:3030', ...parsed });
+      const defaultConfig = {
+        bucketName: '',
+        endpoint: '',
+        region: 'us-east-1',
+        accessKeyId: '',
+        secretAccessKey: '',
+        streamServerUrl: 'ws://localhost:3030',
+      };
+      setS3Config({ ...defaultConfig, ...parsed });
       setCryptoModal({ show: false, mode: 'export', password: '', fileData: null });
     } catch (err) {
       setError("비밀번호가 틀렸거나 파일이 손상되었습니다.");
@@ -187,8 +199,25 @@ const App = () => {
 
   const connectStreamServer = (serverUrl) => {
     if (!serverUrl?.trim()) return null;
+    setLiveStreamError(null);
+    if (streamWsRetryTimerRef.current) {
+      clearTimeout(streamWsRetryTimerRef.current);
+      streamWsRetryTimerRef.current = null;
+    }
+    const prevWs = streamWsRef.current;
+    if (prevWs) {
+      try { prevWs.close(); } catch {}
+      streamWsRef.current = null;
+    }
     setLiveStreamReady(false);
     setViewerUrl('');
+    const scheduleRetry = () => {
+      if (!streamRetryActiveRef.current) return;
+      streamWsRetryTimerRef.current = setTimeout(() => {
+        streamWsRetryTimerRef.current = null;
+        connectStreamServer(serverUrl);
+      }, 5000);
+    };
     try {
       const ws = new WebSocket(serverUrl);
       ws.binaryType = 'arraybuffer';
@@ -200,20 +229,28 @@ const App = () => {
           const msg = JSON.parse(e.data);
           if (msg.ok) {
             setLiveStreamReady(true);
+            setLiveStreamError(null);
             if (msg.viewerUrl) setViewerUrl(msg.viewerUrl);
             else {
               const u = new URL(serverUrl.replace('ws://', 'http://').replace('ws:', 'http:'));
               setViewerUrl(`${u.origin}/`);
             }
           }
-          if (msg.error) setError(`라이브 송출: ${msg.error}`);
+          if (msg.error) setLiveStreamError(`라이브 송출: ${msg.error}`);
         } catch {}
       };
-      ws.onerror = () => setError("스트리밍 서버 연결 실패. 녹화는 계속됩니다.");
+      ws.onerror = () => setLiveStreamError("스트리밍 서버 연결 실패. 녹화는 계속됩니다.");
+      ws.onclose = () => {
+        if (streamRetryActiveRef.current && streamWsRef.current === ws) {
+          streamWsRef.current = null;
+          scheduleRetry();
+        }
+      };
       streamWsRef.current = ws;
       return ws;
     } catch {
-      setError("스트리밍 서버 연결 오류. 녹화는 계속됩니다.");
+      setLiveStreamError("스트리밍 서버 연결 오류. 녹화는 계속됩니다.");
+      if (streamRetryActiveRef.current) scheduleRetry();
       return null;
     }
   };
@@ -225,11 +262,13 @@ const App = () => {
     }
     try {
       setError(null);
+      setLiveStreamError(null);
       if (streamWsRef.current) {
         streamWsRef.current.close();
         streamWsRef.current = null;
       }
       if (s3Config.streamServerUrl?.trim()) {
+        streamRetryActiveRef.current = true;
         connectStreamServer(s3Config.streamServerUrl);
       }
       const fileName = `${getFormattedDate()}.webm`;
@@ -241,6 +280,7 @@ const App = () => {
       const combinedStream = new MediaStream([...screenStream.getVideoTracks(), ...micStream.getAudioTracks()]);
       if (videoPreviewRef.current) videoPreviewRef.current.srcObject = combinedStream;
       const recorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm; codecs=vp9,opus' });
+      pendingWsSendsRef.current = Promise.resolve();
       const flushBuffer = async (isLastPart = false) => {
         const state = uploadStateRef.current;
         if (state.buffer.length === 0) return;
@@ -260,27 +300,38 @@ const App = () => {
         state.uploadPromises.push(p);
       };
 
-      recorder.ondataavailable = async (event) => {
+      recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          const state = uploadStateRef.current;
-          const ab = await event.data.arrayBuffer();
-          state.buffer.push(ab);
-          state.bufferSize += event.data.size;
-          const ws = streamWsRef.current;
-          if (ws?.readyState === WebSocket.OPEN) {
-            try { ws.send(ab); } catch {}
-          }
-          if (state.bufferSize >= MIN_PART_SIZE) await flushBuffer(false);
+          const sendTask = (async () => {
+            const state = uploadStateRef.current;
+            const ab = await event.data.arrayBuffer();
+            state.buffer.push(ab);
+            state.bufferSize += event.data.size;
+            const ws = streamWsRef.current;
+            if (ws?.readyState === WebSocket.OPEN) {
+              try { ws.send(ab); } catch {}
+            }
+            if (state.bufferSize >= MIN_PART_SIZE) await flushBuffer(false);
+          })();
+          pendingWsSendsRef.current = pendingWsSendsRef.current.then(() => sendTask);
         }
       };
       recorder.onstop = async () => {
         setRecordingStatus('processing');
+        streamRetryActiveRef.current = false;
+        if (streamWsRetryTimerRef.current) {
+          clearTimeout(streamWsRetryTimerRef.current);
+          streamWsRetryTimerRef.current = null;
+        }
         combinedStream.getTracks().forEach(t => t.stop());
         setLiveStreamReady(false);
         setViewerUrl('');
         const ws = streamWsRef.current;
         if (ws) {
-          try { ws.close(); } catch {}
+          try {
+            await pendingWsSendsRef.current;
+            ws.close();
+          } catch {}
           streamWsRef.current = null;
         }
         try {
@@ -455,16 +506,17 @@ const App = () => {
                   </div>
                 </div>
                 <div className="space-y-4">
-                  {[{ label: "Endpoint", key: "endpoint", placeholder: "https://minio.yours.com" }, { label: "Bucket Name", key: "bucketName" }, { label: "Region", key: "region" }, { label: "Access Key", key: "accessKeyId", type: "password" }, { label: "Secret Key", key: "secretAccessKey", type: "password" }, { label: "라이브 스트리밍 서버 (선택)", key: "streamServerUrl", placeholder: "ws://localhost:3030" }].map(f => (
+                  {[{ label: "Endpoint", key: "endpoint", placeholder: "https://minio.yours.com" }, { label: "Bucket Name", key: "bucketName" }, { label: "Region", key: "region" }, { label: "Access Key", key: "accessKeyId", type: "password" }, { label: "Secret Key", key: "secretAccessKey", type: "password" }].map(f => (
                     <div key={f.key}>
                       <label className="block text-[10px] uppercase font-black text-slate-500 mb-1">{f.label}</label>
                       <input type={f.type || "text"} className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm focus:border-blue-500 outline-none transition-colors" value={s3Config[f.key]} placeholder={f.placeholder} onChange={(e) => setS3Config({...s3Config, [f.key]: e.target.value})} />
                     </div>
                   ))}
-                </div>
-                <div className="mt-6 pt-4 border-t border-slate-800 space-y-2 text-[10px] text-slate-500 italic">
-                  <p>* 연결 정보는 메모리에만 보관됩니다. 탭을 닫거나 새로고침하면 초기화됩니다.</p>
-                  <p>* 라이브 시청 사용 시: <code className="text-slate-400">bun run server</code>로 서버를 먼저 실행하고, 해당 포트(예: http://localhost:3030/)로 접속하여 실시간 시청할 수 있습니다. ffmpeg 설치 필요.</p>
+                  <div>
+                    <label className="block text-[10px] uppercase font-black text-slate-500 mb-1">라이브 스트리밍 서버 (선택)</label>
+                    <input type="text" className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm focus:border-blue-500 outline-none transition-colors" value={s3Config.streamServerUrl} placeholder="ws://localhost:3030" onChange={(e) => setS3Config({...s3Config, streamServerUrl: e.target.value})} />
+                    {liveStreamError && <p className="mt-1 text-xs text-red-500">{liveStreamError}</p>}
+                  </div>
                 </div>
               </div>
             </div>

@@ -2,6 +2,6 @@ services:
   stream-host:
     build: .
     ports:
-      - "10037:3030"
+      - "10397:3030"
     environment:
       - PORT=3030
