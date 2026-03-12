@@ -1,0 +1,7 @@
+node_modules
+*.log
+.git
+stream-output
+frpc.toml
+run.bat
+readme.txt
