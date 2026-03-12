@@ -1,0 +1,9 @@
+serverAddr = "jaehyung101.synology.me"
+serverPort = 10037
+
+[[proxies]]
+name = "tcp-relay-3030"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 3030
+remotePort = 6000

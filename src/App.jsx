@@ -17,6 +17,8 @@ const App = () => {
   const [uploadProgress, setUploadProgress] = useState({ currentPart: 0, totalSent: 0 });
   const [error, setError] = useState(null);
   const [savedKey, setSavedKey] = useState("");
+  const [liveStreamReady, setLiveStreamReady] = useState(false);
+  const [viewerUrl, setViewerUrl] = useState('');
 
   // S3 연결 정보는 오직 useState(In-Memory)에만 저장됩니다.
   // localStorage나 indexedDB를 사용하지 않으므로 탭 종료 시 자동 삭제됩니다.
@@ -26,6 +28,7 @@ const App = () => {
     region: 'us-east-1',
     accessKeyId: '',
     secretAccessKey: '',
+    streamServerUrl: 'ws://localhost:3030',
   });
 
   // 암호화 모달 상태
@@ -39,6 +42,7 @@ const App = () => {
 
   const mediaRecorderRef = useRef(null);
   const videoPreviewRef = useRef(null);
+  const streamWsRef = useRef(null);
   const uploadStateRef = useRef({
     uploadId: null,
     key: null,
@@ -111,7 +115,8 @@ const App = () => {
       );
 
       const decoded = new TextDecoder().decode(decrypted);
-      setS3Config(JSON.parse(decoded));
+      const parsed = JSON.parse(decoded);
+      setS3Config({ streamServerUrl: 'ws://localhost:3030', ...parsed });
       setCryptoModal({ show: false, mode: 'export', password: '', fileData: null });
     } catch (err) {
       setError("비밀번호가 틀렸거나 파일이 손상되었습니다.");
@@ -180,6 +185,39 @@ const App = () => {
     }));
   };
 
+  const connectStreamServer = (serverUrl) => {
+    if (!serverUrl?.trim()) return null;
+    setLiveStreamReady(false);
+    setViewerUrl('');
+    try {
+      const ws = new WebSocket(serverUrl);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'start' }));
+      };
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.ok) {
+            setLiveStreamReady(true);
+            if (msg.viewerUrl) setViewerUrl(msg.viewerUrl);
+            else {
+              const u = new URL(serverUrl.replace('ws://', 'http://').replace('ws:', 'http:'));
+              setViewerUrl(`${u.origin}/`);
+            }
+          }
+          if (msg.error) setError(`라이브 송출: ${msg.error}`);
+        } catch {}
+      };
+      ws.onerror = () => setError("스트리밍 서버 연결 실패. 녹화는 계속됩니다.");
+      streamWsRef.current = ws;
+      return ws;
+    } catch {
+      setError("스트리밍 서버 연결 오류. 녹화는 계속됩니다.");
+      return null;
+    }
+  };
+
   const startStreaming = async () => {
     if (!s3Config.bucketName || !s3Config.accessKeyId || !s3Config.secretAccessKey) {
       setError("S3 설정을 먼저 완료해주세요.");
@@ -187,6 +225,13 @@ const App = () => {
     }
     try {
       setError(null);
+      if (streamWsRef.current) {
+        streamWsRef.current.close();
+        streamWsRef.current = null;
+      }
+      if (s3Config.streamServerUrl?.trim()) {
+        connectStreamServer(s3Config.streamServerUrl);
+      }
       const fileName = `${getFormattedDate()}.webm`;
       setSavedKey(fileName);
       const { UploadId } = await initMultipartUpload(fileName);
@@ -218,14 +263,26 @@ const App = () => {
       recorder.ondataavailable = async (event) => {
         if (event.data.size > 0) {
           const state = uploadStateRef.current;
-          state.buffer.push(await event.data.arrayBuffer());
+          const ab = await event.data.arrayBuffer();
+          state.buffer.push(ab);
           state.bufferSize += event.data.size;
+          const ws = streamWsRef.current;
+          if (ws?.readyState === WebSocket.OPEN) {
+            try { ws.send(ab); } catch {}
+          }
           if (state.bufferSize >= MIN_PART_SIZE) await flushBuffer(false);
         }
       };
       recorder.onstop = async () => {
         setRecordingStatus('processing');
         combinedStream.getTracks().forEach(t => t.stop());
+        setLiveStreamReady(false);
+        setViewerUrl('');
+        const ws = streamWsRef.current;
+        if (ws) {
+          try { ws.close(); } catch {}
+          streamWsRef.current = null;
+        }
         try {
           await flushBuffer(true);
           await Promise.all(uploadStateRef.current.uploadPromises);
@@ -241,7 +298,10 @@ const App = () => {
   };
 
   const stopStreaming = () => {
-    if (mediaRecorderRef.current) { mediaRecorderRef.current.stop(); setIsRecording(false); }
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
   };
 
   const fetchFileList = async () => {
@@ -327,7 +387,14 @@ const App = () => {
             <div className="lg:col-span-2 space-y-6">
               <div className="aspect-video bg-black rounded-3xl border border-slate-800 overflow-hidden relative shadow-2xl">
                 <video ref={videoPreviewRef} autoPlay muted className="w-full h-full object-contain" />
-                {isRecording && <div className="absolute top-6 right-6 bg-red-600 px-4 py-1.5 rounded-full text-xs font-black flex items-center gap-2 shadow-lg animate-pulse">LIVE</div>}
+                {isRecording && (
+                  <div className="absolute top-6 right-6 flex gap-2">
+                    <div className="bg-red-600 px-4 py-1.5 rounded-full text-xs font-black flex items-center gap-2 shadow-lg animate-pulse">LIVE</div>
+                    {s3Config.streamServerUrl?.trim() && liveStreamReady && (
+                      <div className="bg-amber-600 px-4 py-1.5 rounded-full text-xs font-black flex items-center gap-2 shadow-lg">라이브 송출중</div>
+                    )}
+                  </div>
+                )}
                 {recordingStatus === 'idle' && <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-600"><MonitorPlay size={80} className="mb-4 opacity-10" /><p>방송 시작 버튼을 눌러주세요</p></div>}
                 {recordingStatus === 'success' && (
                   <div className="absolute inset-0 bg-slate-900/95 backdrop-blur-md flex flex-col items-center justify-center text-center p-8">
@@ -338,6 +405,15 @@ const App = () => {
                   </div>
                 )}
               </div>
+              {isRecording && viewerUrl && (
+                <div className="p-4 bg-slate-900 rounded-2xl border border-slate-800 flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-xs text-slate-500 uppercase font-bold mb-1">시청 주소</p>
+                    <p className="text-sm font-mono text-blue-400 truncate">{viewerUrl}</p>
+                  </div>
+                  <button onClick={() => window.open(viewerUrl)} className="shrink-0 bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-bold">새 탭에서 열기</button>
+                </div>
+              )}
               <div className="flex items-center justify-between p-6 bg-slate-900 rounded-2xl border border-slate-800">
                 <div className="space-y-1">
                   <h3 className="font-bold">방송 컨트롤</h3>
@@ -379,15 +455,16 @@ const App = () => {
                   </div>
                 </div>
                 <div className="space-y-4">
-                  {[{ label: "Endpoint", key: "endpoint", placeholder: "https://minio.yours.com" }, { label: "Bucket Name", key: "bucketName" }, { label: "Region", key: "region" }, { label: "Access Key", key: "accessKeyId", type: "password" }, { label: "Secret Key", key: "secretAccessKey", type: "password" }].map(f => (
+                  {[{ label: "Endpoint", key: "endpoint", placeholder: "https://minio.yours.com" }, { label: "Bucket Name", key: "bucketName" }, { label: "Region", key: "region" }, { label: "Access Key", key: "accessKeyId", type: "password" }, { label: "Secret Key", key: "secretAccessKey", type: "password" }, { label: "라이브 스트리밍 서버 (선택)", key: "streamServerUrl", placeholder: "ws://localhost:3030" }].map(f => (
                     <div key={f.key}>
                       <label className="block text-[10px] uppercase font-black text-slate-500 mb-1">{f.label}</label>
                       <input type={f.type || "text"} className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm focus:border-blue-500 outline-none transition-colors" value={s3Config[f.key]} placeholder={f.placeholder} onChange={(e) => setS3Config({...s3Config, [f.key]: e.target.value})} />
                     </div>
                   ))}
                 </div>
-                <div className="mt-6 pt-4 border-t border-slate-800 text-[10px] text-slate-500 italic">
-                  * 연결 정보는 메모리에만 보관됩니다. 탭을 닫거나 새로고침하면 초기화됩니다.
+                <div className="mt-6 pt-4 border-t border-slate-800 space-y-2 text-[10px] text-slate-500 italic">
+                  <p>* 연결 정보는 메모리에만 보관됩니다. 탭을 닫거나 새로고침하면 초기화됩니다.</p>
+                  <p>* 라이브 시청 사용 시: <code className="text-slate-400">bun run server</code>로 서버를 먼저 실행하고, 해당 포트(예: http://localhost:3030/)로 접속하여 실시간 시청할 수 있습니다. ffmpeg 설치 필요.</p>
                 </div>
               </div>
             </div>
