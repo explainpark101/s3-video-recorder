@@ -126,6 +126,8 @@ const wss = new WebSocketServer({ server });
 let activeStreamer = null;
 const viewerSockets = new Set();
 let initChunk = null;
+const chunkBuffer = [];
+const MAX_CHUNK_BUFFER = 15;
 
 function safeWsSend(ws, payload) {
   try {
@@ -154,7 +156,13 @@ wss.on('connection', (ws) => {
   viewerSockets.add(ws);
   if (initChunk) {
     try {
-      if (ws.readyState === ws.OPEN) ws.send(initChunk);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(initChunk);
+        for (const b of chunkBuffer) {
+          if (ws.readyState !== ws.OPEN) break;
+          ws.send(b);
+        }
+      }
     } catch {
       // ignore
     }
@@ -188,6 +196,7 @@ wss.on('connection', (ws) => {
     if (activeStreamer === ws) {
       activeStreamer = null;
       initChunk = null;
+      chunkBuffer.length = 0;
     }
     try {
       if (ws.readyState === ws.OPEN) {
@@ -202,6 +211,7 @@ wss.on('connection', (ws) => {
   function acceptStreamStart() {
     if (isInitialized) return false;
     initChunk = null;
+    chunkBuffer.length = 0;
     isInitialized = true;
     activeStreamer = ws;
     viewerSockets.delete(ws);
@@ -237,6 +247,7 @@ wss.on('connection', (ws) => {
               const prevWs = activeStreamer;
               activeStreamer = null;
               initChunk = null;
+              chunkBuffer.length = 0;
               try {
                 safeWsSend(prevWs, { type: 'stream_closed', reason: 'replaced_by_new_stream' });
                 prevWs.close(1000);
@@ -261,6 +272,8 @@ wss.on('connection', (ws) => {
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
       lastChunkAt = Date.now();
       if (!initChunk) initChunk = buf;
+      chunkBuffer.push(buf);
+      if (chunkBuffer.length > MAX_CHUNK_BUFFER) chunkBuffer.shift();
       sendToViewers(buf, true);
     } catch (outerErr) {
       console.error('WebSocket message handler error:', outerErr);
