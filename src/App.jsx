@@ -471,18 +471,18 @@ const App = () => {
     setSavedKey(fileName);
     initMultipartUpload(fileName).then(({ UploadId }) => {
       uploadStateRef.current = { uploadId: UploadId, key: fileName, parts: [], partNumber: 1, buffer: [], bufferSize: 0, uploadPromises: [] };
-      const videoConstraints = { width: { ideal: 1280 }, height: { ideal: 720 } };
+      const videoConstraints = { width: { ideal: 1920 }, height: { ideal: 1080 } };
       navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: true }).then((screenStream) => {
         const videoTrack = screenStream.getVideoTracks()[0];
         if (videoTrack) {
-          videoTrack.applyConstraints({ width: { ideal: 1280 }, height: { ideal: 720 } }).catch(() => {});
+          videoTrack.applyConstraints({ width: { ideal: 1920 }, height: { ideal: 1080 } }).catch(() => {});
         }
         return navigator.mediaDevices.getUserMedia({ audio: true }).then((micStream) => {
           const combinedStream = new MediaStream([...screenStream.getVideoTracks(), ...micStream.getAudioTracks()]);
           if (videoPreviewRef.current) videoPreviewRef.current.srcObject = combinedStream;
           const recorder = new MediaRecorder(combinedStream, {
             mimeType: 'video/webm; codecs=vp9,opus',
-            videoBitsPerSecond: 1_500_000,
+            videoBitsPerSecond: 2_500_000,
             audioBitsPerSecond: 128_000,
           });
           pendingWsSendsRef.current = Promise.resolve();
@@ -558,18 +558,18 @@ const App = () => {
   };
 
   const doStartStreamingOnly = (viewerUrlFromStream) => {
-    const videoConstraints = { width: { ideal: 1280 }, height: { ideal: 720 } };
+    const videoConstraints = { width: { ideal: 1920 }, height: { ideal: 1080 } };
     navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: true }).then((screenStream) => {
       const videoTrack = screenStream.getVideoTracks()[0];
       if (videoTrack) {
-        videoTrack.applyConstraints({ width: { ideal: 1280 }, height: { ideal: 720 } }).catch(() => {});
+        videoTrack.applyConstraints({ width: { ideal: 1920 }, height: { ideal: 1080 } }).catch(() => {});
       }
       return navigator.mediaDevices.getUserMedia({ audio: true }).then((micStream) => {
         const combinedStream = new MediaStream([...screenStream.getVideoTracks(), ...micStream.getAudioTracks()]);
         if (videoPreviewRef.current) videoPreviewRef.current.srcObject = combinedStream;
         const recorder = new MediaRecorder(combinedStream, {
           mimeType: 'video/webm; codecs=vp9,opus',
-          videoBitsPerSecond: 1_500_000,
+          videoBitsPerSecond: 2_500_000,
           audioBitsPerSecond: 128_000,
         });
         recorder.ondataavailable = (event) => {
