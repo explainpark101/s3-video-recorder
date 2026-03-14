@@ -58,6 +58,7 @@ const App = () => {
   const liveViewMediaSourceRef = useRef(null);
   const liveViewSourceBufferRef = useRef(null);
   const liveViewChunkQueueRef = useRef([]);
+  const liveViewLastEvictRef = useRef(0);
   const uploadStateRef = useRef({
     uploadId: null,
     key: null,
@@ -764,16 +765,60 @@ const App = () => {
     } catch (err) { return ""; }
   };
 
+  const LIVE_VIEW_BUFFER_KEEP_SEC = 30;
+  const LIVE_VIEW_SEEK_BEHIND_SEC = 2;
+
+  const evictLiveViewBuffer = () => {
+    const sb = liveViewSourceBufferRef.current;
+    const videoEl = liveViewVideoRef.current;
+    if (!sb || sb.updating || !videoEl || videoEl.buffered.length === 0) return;
+    const now = Date.now();
+    if (now - liveViewLastEvictRef.current < 3000) return;
+    const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+    const start = videoEl.buffered.start(0);
+    if (end - start <= LIVE_VIEW_BUFFER_KEEP_SEC + 5) return;
+    liveViewLastEvictRef.current = now;
+    const removeEnd = Math.max(0, end - LIVE_VIEW_BUFFER_KEEP_SEC);
+    try {
+      sb.remove(start, removeEnd);
+    } catch {
+      // ignore
+    }
+  };
+
+  const seekLiveViewToEdge = () => {
+    const videoEl = liveViewVideoRef.current;
+    if (!videoEl || videoEl.buffered.length === 0) return;
+    const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+    if (end - videoEl.currentTime > LIVE_VIEW_BUFFER_KEEP_SEC) {
+      try {
+        videoEl.currentTime = end - LIVE_VIEW_SEEK_BEHIND_SEC;
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   const appendNextLiveView = () => {
     const sb = liveViewSourceBufferRef.current;
     const queue = liveViewChunkQueueRef.current;
-    if (!sb || sb.updating || queue.length === 0) return;
+    if (!sb || sb.updating || queue.length === 0) {
+      if (sb && !sb.updating) {
+        evictLiveViewBuffer();
+        seekLiveViewToEdge();
+      }
+      return;
+    }
     const chunk = queue.shift();
     try {
       sb.appendBuffer(chunk);
     } catch (e) {
-      console.warn('appendBuffer error', e);
-      appendNextLiveView();
+      queue.unshift(chunk);
+      if (e.name === 'QuotaExceededError') {
+        evictLiveViewBuffer();
+      } else {
+        console.warn('appendBuffer error', e);
+      }
     }
   };
 
