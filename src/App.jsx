@@ -59,6 +59,10 @@ const App = () => {
   const liveViewSourceBufferRef = useRef(null);
   const liveViewChunkQueueRef = useRef([]);
   const liveViewLastEvictRef = useRef(0);
+  const liveViewChunksReceivedRef = useRef(0);
+  const liveViewChunksAppendedRef = useRef(0);
+  const liveViewLogIntervalRef = useRef(null);
+  const LIVE_VIEW_DEBUG = true;
   const uploadStateRef = useRef({
     uploadId: null,
     key: null,
@@ -557,7 +561,13 @@ const App = () => {
           mediaRecorderRef.current = recorder;
           setIsRecording(true);
           setRecordingStatus('recording');
-          if (viewerUrlFromStream) setViewerUrl(viewerUrlFromStream);
+          if (viewerUrlFromStream) {
+            setViewerUrl(viewerUrlFromStream);
+            const viewerPageUrl = getViewerPageUrlWithStream(viewerUrlFromStream);
+            if (viewerPageUrl && viewerPageUrl.includes('stream=')) {
+              window.open(viewerPageUrl, '_blank');
+            }
+          }
         });
       }).catch((err) => setError(err?.message || '미디어 장치 오류'));
     }).catch((err) => setError(err?.message || '업로드 초기화 실패'));
@@ -608,7 +618,13 @@ const App = () => {
         mediaRecorderRef.current = recorder;
         setIsRecording(true);
         setRecordingStatus('recording');
-        if (viewerUrlFromStream) setViewerUrl(viewerUrlFromStream);
+        if (viewerUrlFromStream) {
+          setViewerUrl(viewerUrlFromStream);
+          const viewerPageUrl = getViewerPageUrlWithStream(viewerUrlFromStream);
+          if (viewerPageUrl && viewerPageUrl.includes('stream=')) {
+            window.open(viewerPageUrl, '_blank');
+          }
+        }
       });
     }).catch((err) => setError(err?.message || '미디어 장치 오류'));
   };
@@ -767,6 +783,15 @@ const App = () => {
 
   const LIVE_VIEW_BUFFER_KEEP_SEC = 30;
   const LIVE_VIEW_SEEK_BEHIND_SEC = 2;
+  const LIVE_VIEW_MIN_BUFFER_BEFORE_SEEK_SEC = 5;
+
+  const ensureLiveViewPlaying = () => {
+    const videoEl = liveViewVideoRef.current;
+    if (!videoEl || videoEl.buffered.length === 0) return;
+    if (videoEl.paused) {
+      videoEl.play().catch(() => {});
+    }
+  };
 
   const evictLiveViewBuffer = () => {
     const sb = liveViewSourceBufferRef.current;
@@ -777,12 +802,18 @@ const App = () => {
     const end = videoEl.buffered.end(videoEl.buffered.length - 1);
     const start = videoEl.buffered.start(0);
     if (end - start <= LIVE_VIEW_BUFFER_KEEP_SEC + 5) return;
+    const currentTime = videoEl.currentTime;
+    let removeEnd = Math.max(0, end - LIVE_VIEW_BUFFER_KEEP_SEC);
+    removeEnd = Math.min(removeEnd, currentTime - 2);
+    if (removeEnd <= start) return;
     liveViewLastEvictRef.current = now;
-    const removeEnd = Math.max(0, end - LIVE_VIEW_BUFFER_KEEP_SEC);
+    if (LIVE_VIEW_DEBUG) {
+      console.log('[LiveView] evict: remove(', start.toFixed(1), ',', removeEnd.toFixed(1), ') buffered end=', end.toFixed(1), 'currentTime=', currentTime.toFixed(1));
+    }
     try {
       sb.remove(start, removeEnd);
-    } catch {
-      // ignore
+    } catch (err) {
+      if (LIVE_VIEW_DEBUG) console.warn('[LiveView] evict remove() failed', err);
     }
   };
 
@@ -790,11 +821,18 @@ const App = () => {
     const videoEl = liveViewVideoRef.current;
     if (!videoEl || videoEl.buffered.length === 0) return;
     const end = videoEl.buffered.end(videoEl.buffered.length - 1);
-    if (end - videoEl.currentTime > LIVE_VIEW_BUFFER_KEEP_SEC) {
+    const start = videoEl.buffered.start(0);
+    const bufferDuration = end - start;
+    if (bufferDuration < LIVE_VIEW_MIN_BUFFER_BEFORE_SEEK_SEC) return;
+    const lag = end - videoEl.currentTime;
+    if (lag > LIVE_VIEW_SEEK_BEHIND_SEC + 1) {
+      const target = end - LIVE_VIEW_SEEK_BEHIND_SEC;
       try {
-        videoEl.currentTime = end - LIVE_VIEW_SEEK_BEHIND_SEC;
-      } catch {
-        // ignore
+        videoEl.currentTime = target;
+        if (LIVE_VIEW_DEBUG) console.log('[LiveView] seek to live edge: currentTime', videoEl.currentTime.toFixed(1), '->', target.toFixed(1), '(end=', end.toFixed(1), 'lag=', lag.toFixed(1), 's)');
+        videoEl.play().catch(() => {});
+      } catch (err) {
+        if (LIVE_VIEW_DEBUG) console.warn('[LiveView] seek failed', err);
       }
     }
   };
@@ -802,22 +840,41 @@ const App = () => {
   const appendNextLiveView = () => {
     const sb = liveViewSourceBufferRef.current;
     const queue = liveViewChunkQueueRef.current;
-    if (!sb || sb.updating || queue.length === 0) {
-      if (sb && !sb.updating) {
-        evictLiveViewBuffer();
-        seekLiveViewToEdge();
+    const videoEl = liveViewVideoRef.current;
+    if (!sb || sb.updating) return;
+    if (videoEl?.error) {
+      if (LIVE_VIEW_DEBUG) {
+        console.warn('[LiveView] video.error - skip append', videoEl.error?.code, videoEl.error?.message, '재연결이 필요합니다.');
       }
+      setLiveViewError(`재생 오류 (${videoEl.error?.message || videoEl.error?.code || 'MEDIA_ERR'}). 연결을 끊고 다시 연결해 주세요.`);
+      setLiveViewStatus('error');
+      return;
+    }
+    seekLiveViewToEdge();
+    ensureLiveViewPlaying();
+    if (queue.length === 0) {
+      evictLiveViewBuffer();
       return;
     }
     const chunk = queue.shift();
+    const queueLen = queue.length;
+    if (LIVE_VIEW_DEBUG && (liveViewChunksAppendedRef.current < 20 || liveViewChunksAppendedRef.current % 30 === 0)) {
+      console.log('[LiveView] appendBuffer #', liveViewChunksAppendedRef.current + 1, 'size=', chunk.byteLength, 'queueAfter=', queueLen);
+    }
     try {
       sb.appendBuffer(chunk);
+      liveViewChunksAppendedRef.current += 1;
     } catch (e) {
       queue.unshift(chunk);
-      if (e.name === 'QuotaExceededError') {
-        evictLiveViewBuffer();
+      if (e?.message?.includes('error attribute is not null')) {
+        if (LIVE_VIEW_DEBUG) console.warn('[LiveView] appendBuffer failed: video.error=', videoEl?.error?.code, videoEl?.error?.message);
+        setLiveViewError(`재생 오류 (${videoEl?.error?.message || videoEl?.error?.code || 'MEDIA_ERR'}). 연결을 끊고 다시 연결해 주세요.`);
+        setLiveViewStatus('error');
       } else {
-        console.warn('appendBuffer error', e);
+        console.warn('[LiveView] appendBuffer error', e?.name, e?.message, 'queueLen=', queue.length, 're-queued chunk');
+        if (e?.name === 'QuotaExceededError') {
+          evictLiveViewBuffer();
+        }
       }
     }
   };
@@ -851,10 +908,43 @@ const App = () => {
     const videoEl = liveViewVideoRef.current;
     if (videoEl) {
       videoEl.src = URL.createObjectURL(mediaSource);
+      videoEl.addEventListener('error', () => {
+        const err = videoEl.error;
+        if (err) {
+          console.warn('[LiveView] video.error', err.code, err.message, err);
+          setLiveViewError(`재생 오류 (${err.message || 'code ' + err.code}). 연결을 끊고 다시 연결해 주세요.`);
+          setLiveViewStatus('error');
+        }
+      });
     }
 
     mediaSource.addEventListener('sourceopen', () => {
       try {
+        liveViewChunksReceivedRef.current = 0;
+        liveViewChunksAppendedRef.current = 0;
+        if (liveViewLogIntervalRef.current) clearInterval(liveViewLogIntervalRef.current);
+        liveViewLogIntervalRef.current = setInterval(() => {
+          const v = liveViewVideoRef.current;
+          const sb = liveViewSourceBufferRef.current;
+          if (!v || !sb) return;
+          if (v.error) {
+            console.warn('[LiveView] state video.error', v.error.code, v.error.message);
+            return;
+          }
+          if (v.buffered.length === 0) {
+            console.log('[LiveView] state no buffer yet queue=', liveViewChunkQueueRef.current.length, 'updating=', sb.updating);
+            return;
+          }
+          const start = v.buffered.start(0);
+          const end = v.buffered.end(v.buffered.length - 1);
+          const lag = end - v.currentTime;
+          if (v.paused) {
+            console.log('[LiveView] state PAUSED - calling play() buffered=', start.toFixed(1), '~', end.toFixed(1), 's');
+            v.play().catch((e) => console.warn('[LiveView] play() failed', e));
+          }
+          console.log('[LiveView] state buffered=', start.toFixed(1), '~', end.toFixed(1), 's currentTime=', v.currentTime.toFixed(1), 'lag=', lag.toFixed(1), 's queue=', liveViewChunkQueueRef.current.length, 'updating=', sb.updating, 'paused=', v.paused);
+        }, 2000);
+
         const sb = mediaSource.addSourceBuffer(mime);
         liveViewSourceBufferRef.current = sb;
         sb.addEventListener('updateend', appendNextLiveView);
@@ -872,7 +962,11 @@ const App = () => {
     ws.binaryType = 'arraybuffer';
     ws.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer && e.data.byteLength > 0) {
+        liveViewChunksReceivedRef.current += 1;
         liveViewChunkQueueRef.current.push(e.data);
+        if (LIVE_VIEW_DEBUG && (liveViewChunksReceivedRef.current <= 20 || liveViewChunksReceivedRef.current % 30 === 0)) {
+          console.log('[LiveView] chunk received #', liveViewChunksReceivedRef.current, 'size=', e.data.byteLength, 'queueLen=', liveViewChunkQueueRef.current.length);
+        }
         appendNextLiveView();
       }
     };
@@ -888,6 +982,10 @@ const App = () => {
   };
 
   const disconnectLiveView = () => {
+    if (liveViewLogIntervalRef.current) {
+      clearInterval(liveViewLogIntervalRef.current);
+      liveViewLogIntervalRef.current = null;
+    }
     const ws = liveViewWsRef.current;
     if (ws) {
       try { ws.close(); } catch {}
@@ -900,6 +998,18 @@ const App = () => {
     if (videoEl) videoEl.src = '';
     setLiveViewStatus('idle');
     setLiveViewError('');
+  };
+
+  const getViewerPageUrlWithStream = (wsUrl) => {
+    const base = typeof window !== 'undefined' ? `${window.location.origin}${window.location.pathname}` : '';
+    const url = (wsUrl || '').trim();
+    if (!url) return base;
+    try {
+      const encoded = typeof btoa !== 'undefined' ? btoa(unescape(encodeURIComponent(url))) : '';
+      return encoded ? `${base}?stream=${encoded}` : base;
+    } catch {
+      return base;
+    }
   };
 
   const getShareableStreamUrl = () => {
