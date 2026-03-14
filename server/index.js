@@ -1,20 +1,15 @@
 /**
  * 라이브 스트리밍 호스팅 서버
- * 브라우저에서 WebSocket으로 전송한 WebM 청크를 HLS로 변환하여 HTTP로 시청 가능하게 합니다.
+ * 브라우저에서 WebSocket으로 전송한 WebM 청크를 시청자 WebSocket으로 그대로 전달합니다. (ts 변환 없음, ffmpeg 불필요)
  * 사용: bun run server 또는 node server/index.js
- * 환경: 시스템에 ffmpeg 설치 필요
  */
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { join, dirname } from 'path';
-import { mkdirSync, existsSync, readFileSync } from 'fs';
+import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3030;
-const STREAM_DIR = join(__dirname, 'stream-output');
-
-if (!existsSync(STREAM_DIR)) mkdirSync(STREAM_DIR, { recursive: true });
 
 const VIEWER_HTML = `<!DOCTYPE html>
 <html lang="ko">
@@ -22,7 +17,6 @@ const VIEWER_HTML = `<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>라이브 시청 - S3 Video Recorder</title>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem; }
@@ -35,7 +29,7 @@ const VIEWER_HTML = `<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>라이브 스트림</h1>
+  <h1>라이브 스트림 (WebM)</h1>
   <div class="player-wrap">
     <video id="video" controls muted playsinline></video>
   </div>
@@ -43,35 +37,58 @@ const VIEWER_HTML = `<!DOCTYPE html>
   <script>
     const video = document.getElementById('video');
     const statusEl = document.getElementById('status');
-    let retryCount = 0;
-    const maxRetries = 60;
+    const mime = 'video/webm; codecs="vp9,opus"';
+    if (!MediaSource.isTypeSupported(mime)) {
+      statusEl.textContent = '이 브라우저는 WebM VP9 재생을 지원하지 않습니다.';
+      statusEl.className = 'status';
+    } else {
+      const mediaSource = new MediaSource();
+      video.src = URL.createObjectURL(mediaSource);
+      let sourceBuffer = null;
+      const chunkQueue = [];
+      let connecting = true;
 
-    function tryLoad() {
-      fetch('/stream.m3u8', { method: 'HEAD' }).then(r => {
-        if (r.ok) {
+      function appendNext() {
+        if (!sourceBuffer || sourceBuffer.updating || chunkQueue.length === 0) return;
+        const chunk = chunkQueue.shift();
+        try {
+          sourceBuffer.appendBuffer(chunk);
+        } catch (e) {
+          console.warn('appendBuffer error', e);
+          appendNext();
+        }
+      }
+
+      mediaSource.addEventListener('sourceopen', () => {
+        try {
+          sourceBuffer = mediaSource.addSourceBuffer(mime);
+          sourceBuffer.addEventListener('updateend', appendNext);
           statusEl.textContent = 'LIVE';
           statusEl.className = 'status live';
-          if (Hls.isSupported()) {
-            const hls = new Hls();
-            hls.loadSource('/stream.m3u8');
-            hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
-          } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            video.src = '/stream.m3u8';
-            video.addEventListener('loadedmetadata', () => video.play().catch(() => {}));
-          }
-        } else if (retryCount < maxRetries) {
-          retryCount++;
-          setTimeout(tryLoad, 2000);
-        }
-      }).catch(() => {
-        if (retryCount < maxRetries) {
-          retryCount++;
-          setTimeout(tryLoad, 2000);
+          video.play().catch(() => {});
+          appendNext();
+        } catch (e) {
+          statusEl.textContent = 'SourceBuffer 오류: ' + e.message;
         }
       });
+
+      const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(wsScheme + '//' + location.host);
+      ws.binaryType = 'arraybuffer';
+      ws.onmessage = (e) => {
+        if (e.data instanceof ArrayBuffer && e.data.byteLength > 0) {
+          chunkQueue.push(e.data);
+          appendNext();
+        }
+      };
+      ws.onopen = () => { connecting = false; };
+      ws.onerror = () => {
+        if (connecting) statusEl.textContent = '서버 연결 실패. 방송이 시작되면 자동으로 재연결합니다.';
+      };
+      ws.onclose = () => {
+        if (document.hasFocus()) setTimeout(() => location.reload(), 3000);
+      };
     }
-    tryLoad();
   </script>
 </body>
 </html>`;
@@ -87,19 +104,6 @@ const server = createServer((req, res) => {
     if (url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok', service: 'stream-host' }));
-      return;
-    }
-    if (url === '/stream.m3u8' || (url.startsWith('/stream_') && url.endsWith('.ts'))) {
-      const filePath = join(STREAM_DIR, url.slice(1));
-      if (!existsSync(filePath)) {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
-      const content = readFileSync(filePath);
-      const contentType = url.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/MP2T';
-      res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-cache' });
-      res.end(content);
       return;
     }
     res.writeHead(404);
@@ -119,8 +123,9 @@ const server = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-// 단일 스트리머 강제용 전역 상태
 let activeStreamer = null;
+const viewerSockets = new Set();
+let initChunk = null;
 
 function safeWsSend(ws, payload) {
   try {
@@ -132,8 +137,29 @@ function safeWsSend(ws, payload) {
   }
 }
 
+function sendToViewers(data, isBinary) {
+  for (const v of viewerSockets) {
+    try {
+      if (v.readyState === v.OPEN) {
+        if (isBinary) v.send(data);
+        else v.send(JSON.stringify(data));
+      }
+    } catch {
+      // skip
+    }
+  }
+}
+
 wss.on('connection', (ws) => {
-  let ffmpegProcess = null;
+  viewerSockets.add(ws);
+  if (initChunk) {
+    try {
+      if (ws.readyState === ws.OPEN) ws.send(initChunk);
+    } catch {
+      // ignore
+    }
+  }
+
   let isInitialized = false;
   let inactivityTimer = null;
   let lastChunkAt = null;
@@ -148,11 +174,10 @@ wss.on('connection', (ws) => {
   function startInactivityWatch() {
     clearInactivityWatch();
     lastChunkAt = Date.now();
-    const INACTIVITY_LIMIT_MS = 2 * 60 * 1000; // 2분
+    const INACTIVITY_LIMIT_MS = 2 * 60 * 1000;
     inactivityTimer = setInterval(() => {
       if (!lastChunkAt) return;
-      const diff = Date.now() - lastChunkAt;
-      if (diff >= INACTIVITY_LIMIT_MS) {
+      if (Date.now() - lastChunkAt >= INACTIVITY_LIMIT_MS) {
         stopStream('inactivity_timeout');
       }
     }, 10_000);
@@ -160,21 +185,10 @@ wss.on('connection', (ws) => {
 
   function stopStream(reason = 'stopped') {
     clearInactivityWatch();
-
-    if (ffmpegProcess) {
-      try {
-        ffmpegProcess.stdin.end();
-      } catch {}
-      try {
-        ffmpegProcess.kill('SIGTERM');
-      } catch {}
-      ffmpegProcess = null;
-    }
-
     if (activeStreamer === ws) {
       activeStreamer = null;
+      initChunk = null;
     }
-
     try {
       if (ws.readyState === ws.OPEN) {
         safeWsSend(ws, { type: 'stream_closed', reason });
@@ -185,13 +199,23 @@ wss.on('connection', (ws) => {
     }
   }
 
+  function acceptStreamStart() {
+    if (isInitialized) return false;
+    initChunk = null;
+    isInitialized = true;
+    activeStreamer = ws;
+    viewerSockets.delete(ws);
+    startInactivityWatch();
+    safeWsSend(ws, { ok: true, message: 'Stream started', viewerUrl: `http://localhost:${PORT}/` });
+    return true;
+  }
+
   ws.on('message', (data, isBinary) => {
     try {
       if (!isBinary) {
         try {
           const msg = JSON.parse(data.toString());
           if (msg.type === 'start' || msg.start) {
-            // 이미 다른 스트리머가 방송 중이면 거부
             if (activeStreamer && activeStreamer !== ws && activeStreamer.readyState === ws.OPEN) {
               safeWsSend(ws, { error: 'stream_already_running' });
               return;
@@ -200,18 +224,29 @@ wss.on('connection', (ws) => {
               safeWsSend(ws, { error: 'stream_already_initialized' });
               return;
             }
-
-            startFfmpeg().catch((err) => {
-              console.error('startFfmpeg error:', err);
-              safeWsSend(ws, { error: 'failed_to_start_ffmpeg' });
-            });
-            isInitialized = true;
-            activeStreamer = ws;
-            startInactivityWatch();
-            safeWsSend(ws, { ok: true, message: 'Stream started', viewerUrl: `http://localhost:${PORT}/` });
+            acceptStreamStart();
             return;
           }
-
+          if (msg.type === 'start_replace') {
+            if (isInitialized) {
+              safeWsSend(ws, { error: 'stream_already_initialized' });
+              return;
+            }
+            // 기존 방송 강제 해제: 새로 연결한 클라이언트가 start_replace만 보내도 기존 스트리머를 끊고 이 연결을 스트리머로 승인
+            if (activeStreamer && activeStreamer !== ws && activeStreamer.readyState === activeStreamer.OPEN) {
+              const prevWs = activeStreamer;
+              activeStreamer = null;
+              initChunk = null;
+              try {
+                safeWsSend(prevWs, { type: 'stream_closed', reason: 'replaced_by_new_stream' });
+                prevWs.close(1000);
+              } catch {
+                // ignore
+              }
+            }
+            acceptStreamStart();
+            return;
+          }
           if (msg.type === 'close' || msg.stop) {
             stopStream('close_request');
           }
@@ -221,82 +256,20 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // 단일 스트리머가 아닐 경우 스트림 데이터 무시
-      if (activeStreamer && activeStreamer !== ws) return;
-
-      if (!isInitialized || !ffmpegProcess || !ffmpegProcess.stdin.writable) return;
+      if (activeStreamer !== ws || !isInitialized) return;
 
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      try {
-        lastChunkAt = Date.now();
-        const canWrite = ffmpegProcess.stdin.write(buf);
-        if (!canWrite) {
-          console.warn('ffmpeg stdin backpressure: pausing WebSocket temporarily');
-        }
-      } catch (err) {
-        console.error('ffmpeg stdin write error:', err.message);
-      }
+      lastChunkAt = Date.now();
+      if (!initChunk) initChunk = buf;
+      sendToViewers(buf, true);
     } catch (outerErr) {
       console.error('WebSocket message handler error:', outerErr);
       safeWsSend(ws, { error: 'internal_stream_error' });
     }
   });
 
-  async function startFfmpeg() {
-    try {
-      if (ffmpegProcess) {
-        try {
-          ffmpegProcess.stdin.end();
-          ffmpegProcess.kill('SIGTERM');
-        } catch {
-          // ignore
-        }
-      }
-
-      const { spawn } = await import('child_process');
-      const outputPath = join(STREAM_DIR, 'stream.m3u8');
-      ffmpegProcess = spawn('ffmpeg', [
-        '-i', 'pipe:0',
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-tune', 'zerolatency',
-        '-c:a', 'aac',
-        '-f', 'hls',
-        '-hls_time', '2',
-        '-hls_list_size', '5',
-        '-hls_flags', 'delete_segments+append_list',
-        '-hls_segment_filename', join(STREAM_DIR, 'stream_%03d.ts'),
-        outputPath,
-      ], {
-        stdio: ['pipe', 'ignore', 'pipe'],
-      });
-
-      ffmpegProcess.stderr.on('data', (chunk) => {
-        const str = chunk.toString();
-        if (str.includes('Error') || str.includes('error')) {
-          console.error('[ffmpeg]', str);
-        }
-      });
-
-      ffmpegProcess.on('error', (err) => {
-        console.error('ffmpeg spawn error:', err.message);
-        safeWsSend(ws, { error: `ffmpeg error: ${err.message}` });
-      });
-
-      ffmpegProcess.on('close', (code, signal) => {
-        ffmpegProcess = null;
-        if (code !== 0 && code !== null) {
-          console.log('[ffmpeg] exited with code', code);
-        }
-      });
-    } catch (err) {
-      console.error('startFfmpeg fatal error:', err);
-      safeWsSend(ws, { error: 'ffmpeg_start_failed' });
-      throw err;
-    }
-  }
-
   ws.on('close', () => {
+    viewerSockets.delete(ws);
     stopStream('ws_closed');
   });
 });

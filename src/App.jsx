@@ -20,6 +20,11 @@ const App = () => {
   const [liveStreamReady, setLiveStreamReady] = useState(false);
   const [viewerUrl, setViewerUrl] = useState('');
   const [liveStreamError, setLiveStreamError] = useState(null);
+  const [replaceStreamModal, setReplaceStreamModal] = useState(false);
+  const [streamDisconnectedReason, setStreamDisconnectedReason] = useState(null);
+  const [recordOnlyConfirmModal, setRecordOnlyConfirmModal] = useState(false);
+  const [streamOnlyConfirmModal, setStreamOnlyConfirmModal] = useState(false);
+  const [forceReplaceConfirmModal, setForceReplaceConfirmModal] = useState(false);
 
   // S3 연결 정보는 오직 useState(In-Memory)에만 저장됩니다.
   // localStorage나 indexedDB를 사용하지 않으므로 탭 종료 시 자동 삭제됩니다.
@@ -47,6 +52,7 @@ const App = () => {
   const streamWsRetryTimerRef = useRef(null);
   const streamRetryActiveRef = useRef(false);
   const pendingWsSendsRef = useRef(Promise.resolve());
+  const onStreamStartOkRef = useRef(null);
   const uploadStateRef = useRef({
     uploadId: null,
     key: null,
@@ -197,6 +203,41 @@ const App = () => {
     }));
   };
 
+  const getViewerUrlFromMsg = (msg, serverUrl) => {
+    if (msg?.viewerUrl) return msg.viewerUrl;
+    try {
+      const u = new URL(serverUrl.replace('ws://', 'http://').replace('ws:', 'http:'));
+      return `${u.origin}/`;
+    } catch {
+      return '';
+    }
+  };
+
+  const attachStreamOngoingHandlers = (ws, serverUrl) => {
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.ok) {
+          setLiveStreamReady(true);
+          setLiveStreamError(null);
+          setStreamDisconnectedReason(null);
+          const url = getViewerUrlFromMsg(msg, serverUrl);
+          setViewerUrl(url);
+          if (onStreamStartOkRef.current) {
+            const fn = onStreamStartOkRef.current;
+            onStreamStartOkRef.current = null;
+            fn(url);
+          }
+        }
+        if (msg.type === 'stream_closed') {
+          setLiveStreamReady(false);
+          setStreamDisconnectedReason(msg.reason || 'closed');
+        }
+        if (msg.error) setLiveStreamError(`라이브 송출: ${msg.error}`);
+      } catch {}
+    };
+  };
+
   const connectStreamServer = (serverUrl) => {
     if (!serverUrl?.trim()) return null;
     setLiveStreamError(null);
@@ -224,21 +265,7 @@ const App = () => {
       ws.onopen = () => {
         ws.send(JSON.stringify({ type: 'start' }));
       };
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.ok) {
-            setLiveStreamReady(true);
-            setLiveStreamError(null);
-            if (msg.viewerUrl) setViewerUrl(msg.viewerUrl);
-            else {
-              const u = new URL(serverUrl.replace('ws://', 'http://').replace('ws:', 'http:'));
-              setViewerUrl(`${u.origin}/`);
-            }
-          }
-          if (msg.error) setLiveStreamError(`라이브 송출: ${msg.error}`);
-        } catch {}
-      };
+      attachStreamOngoingHandlers(ws, serverUrl);
       ws.onerror = () => setLiveStreamError("스트리밍 서버 연결 실패. 녹화는 계속됩니다.");
       ws.onclose = () => {
         if (streamRetryActiveRef.current && streamWsRef.current === ws) {
@@ -255,97 +282,452 @@ const App = () => {
     }
   };
 
+  const connectAndRequestStart = (serverUrl) => {
+    return new Promise((resolve) => {
+      if (!serverUrl?.trim()) {
+        resolve({ ok: true, viewerUrl: '' });
+        return;
+      }
+      setLiveStreamError(null);
+      setStreamDisconnectedReason(null);
+      const prevWs = streamWsRef.current;
+      if (prevWs) {
+        try { prevWs.close(); } catch {}
+        streamWsRef.current = null;
+      }
+      setLiveStreamReady(false);
+      setViewerUrl('');
+      let resolved = false;
+      const scheduleRetry = () => {
+        if (!streamRetryActiveRef.current) return;
+        streamWsRetryTimerRef.current = setTimeout(() => {
+          streamWsRetryTimerRef.current = null;
+          connectStreamServer(serverUrl);
+        }, 5000);
+      };
+      try {
+        const ws = new WebSocket(serverUrl);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'start' }));
+        };
+        ws.onmessage = (e) => {
+          if (resolved) return;
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.ok) {
+              resolved = true;
+              streamWsRef.current = ws;
+              attachStreamOngoingHandlers(ws, serverUrl);
+              ws.onerror = () => setLiveStreamError("스트리밍 서버 연결 실패. 녹화는 계속됩니다.");
+              ws.onclose = () => {
+                if (streamRetryActiveRef.current && streamWsRef.current === ws) {
+                  streamWsRef.current = null;
+                  scheduleRetry();
+                }
+              };
+              setLiveStreamReady(true);
+              setLiveStreamError(null);
+              const url = getViewerUrlFromMsg(msg, serverUrl);
+              setViewerUrl(url);
+              resolve({ ok: true, viewerUrl: url });
+              return;
+            }
+            if (msg.error === 'stream_already_running') {
+              resolved = true;
+              streamWsRef.current = ws;
+              attachStreamOngoingHandlers(ws, serverUrl);
+              ws.onerror = () => setLiveStreamError("스트리밍 서버 연결 실패. 녹화는 계속됩니다.");
+              ws.onclose = () => {
+                if (streamRetryActiveRef.current && streamWsRef.current === ws) {
+                  streamWsRef.current = null;
+                  scheduleRetry();
+                }
+              };
+              resolve({ replace: true });
+              return;
+            }
+            if (msg.error) {
+              resolved = true;
+              resolve({ error: msg.error });
+              ws.close();
+            }
+          } catch {
+            if (!resolved) {
+              resolved = true;
+              resolve({ error: 'Invalid response' });
+              ws.close();
+            }
+          }
+        };
+        ws.onerror = () => {
+          if (!resolved) {
+            resolved = true;
+            resolve({ error: 'connection_failed' });
+          }
+        };
+        ws.onclose = () => {
+          if (!resolved) {
+            resolved = true;
+            resolve({ error: 'closed' });
+          } else if (streamRetryActiveRef.current && streamWsRef.current === ws) {
+            streamWsRef.current = null;
+            scheduleRetry();
+          }
+        };
+      } catch {
+        resolve({ error: 'connect_error' });
+      }
+    });
+  };
+
+  const connectAndForceReplace = (serverUrl) => {
+    return new Promise((resolve) => {
+      if (!serverUrl?.trim()) {
+        resolve({ error: 'no_server_url' });
+        return;
+      }
+      setLiveStreamError(null);
+      setStreamDisconnectedReason(null);
+      const prevWs = streamWsRef.current;
+      if (prevWs) {
+        try { prevWs.close(); } catch {}
+        streamWsRef.current = null;
+      }
+      setLiveStreamReady(false);
+      setViewerUrl('');
+      let resolved = false;
+      const scheduleRetry = () => {
+        if (!streamRetryActiveRef.current) return;
+        streamWsRetryTimerRef.current = setTimeout(() => {
+          streamWsRetryTimerRef.current = null;
+          connectStreamServer(serverUrl);
+        }, 5000);
+      };
+      try {
+        const ws = new WebSocket(serverUrl);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'start_replace' }));
+        };
+        ws.onmessage = (e) => {
+          if (resolved) return;
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.ok) {
+              resolved = true;
+              streamWsRef.current = ws;
+              attachStreamOngoingHandlers(ws, serverUrl);
+              ws.onerror = () => setLiveStreamError("스트리밍 서버 연결 실패. 녹화는 계속됩니다.");
+              ws.onclose = () => {
+                if (streamRetryActiveRef.current && streamWsRef.current === ws) {
+                  streamWsRef.current = null;
+                  scheduleRetry();
+                }
+              };
+              setLiveStreamReady(true);
+              setLiveStreamError(null);
+              const url = getViewerUrlFromMsg(msg, serverUrl);
+              setViewerUrl(url);
+              resolve({ ok: true, viewerUrl: url });
+              return;
+            }
+            if (msg.error) {
+              resolved = true;
+              resolve({ error: msg.error });
+              ws.close();
+            }
+          } catch {
+            if (!resolved) {
+              resolved = true;
+              resolve({ error: 'Invalid response' });
+              ws.close();
+            }
+          }
+        };
+        ws.onerror = () => {
+          if (!resolved) {
+            resolved = true;
+            resolve({ error: 'connection_failed' });
+          }
+        };
+        ws.onclose = () => {
+          if (!resolved) {
+            resolved = true;
+            resolve({ error: 'closed' });
+          } else if (streamRetryActiveRef.current && streamWsRef.current === ws) {
+            streamWsRef.current = null;
+            scheduleRetry();
+          }
+        };
+      } catch {
+        resolve({ error: 'connect_error' });
+      }
+    });
+  };
+
+  const doStartRecording = (viewerUrlFromStream) => {
+    const fileName = `${getFormattedDate()}.webm`;
+    setSavedKey(fileName);
+    initMultipartUpload(fileName).then(({ UploadId }) => {
+      uploadStateRef.current = { uploadId: UploadId, key: fileName, parts: [], partNumber: 1, buffer: [], bufferSize: 0, uploadPromises: [] };
+      const videoConstraints = { width: { ideal: 1280 }, height: { ideal: 720 } };
+      navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: true }).then((screenStream) => {
+        const videoTrack = screenStream.getVideoTracks()[0];
+        if (videoTrack) {
+          videoTrack.applyConstraints({ width: { ideal: 1280 }, height: { ideal: 720 } }).catch(() => {});
+        }
+        return navigator.mediaDevices.getUserMedia({ audio: true }).then((micStream) => {
+          const combinedStream = new MediaStream([...screenStream.getVideoTracks(), ...micStream.getAudioTracks()]);
+          if (videoPreviewRef.current) videoPreviewRef.current.srcObject = combinedStream;
+          const recorder = new MediaRecorder(combinedStream, {
+            mimeType: 'video/webm; codecs=vp9,opus',
+            videoBitsPerSecond: 1_500_000,
+            audioBitsPerSecond: 128_000,
+          });
+          pendingWsSendsRef.current = Promise.resolve();
+          const flushBuffer = async (isLastPart = false) => {
+            const state = uploadStateRef.current;
+            if (state.buffer.length === 0) return;
+            const totalSize = state.buffer.reduce((s, c) => s + c.byteLength, 0);
+            if (!isLastPart && totalSize < MIN_PART_SIZE) return;
+            const chunks = state.buffer;
+            state.buffer = [];
+            state.bufferSize = 0;
+            const num = state.partNumber++;
+            setUploadProgress(prev => ({ ...prev, currentPart: num }));
+            const combined = new Uint8Array(totalSize);
+            let offset = 0;
+            for (const c of chunks) { combined.set(new Uint8Array(c), offset); offset += c.byteLength; }
+            const p = uploadPart(combined, num, state.uploadId, state.key)
+              .then(({ ETag }) => { state.parts.push({ ETag, PartNumber: num }); setUploadProgress(prev => ({ ...prev, totalSent: prev.totalSent + combined.byteLength })); })
+              .catch((err) => setError(`업로드 실패: ${err.message}`));
+            state.uploadPromises.push(p);
+          };
+
+          recorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+              const sendTask = (async () => {
+                const state = uploadStateRef.current;
+                const ab = await event.data.arrayBuffer();
+                state.buffer.push(ab);
+                state.bufferSize += event.data.size;
+                const ws = streamWsRef.current;
+                if (ws?.readyState === WebSocket.OPEN) {
+                  try { ws.send(ab); } catch {}
+                }
+                if (state.bufferSize >= MIN_PART_SIZE) await flushBuffer(false);
+              })();
+              pendingWsSendsRef.current = pendingWsSendsRef.current.then(() => sendTask);
+            }
+          };
+          recorder.onstop = async () => {
+            setRecordingStatus('processing');
+            streamRetryActiveRef.current = false;
+            if (streamWsRetryTimerRef.current) {
+              clearTimeout(streamWsRetryTimerRef.current);
+              streamWsRetryTimerRef.current = null;
+            }
+            combinedStream.getTracks().forEach(t => t.stop());
+            setLiveStreamReady(false);
+            setViewerUrl('');
+            setStreamDisconnectedReason(null);
+            const ws = streamWsRef.current;
+            if (ws) {
+              try {
+                await pendingWsSendsRef.current;
+                ws.close();
+              } catch {}
+              streamWsRef.current = null;
+            }
+            try {
+              await flushBuffer(true);
+              await Promise.all(uploadStateRef.current.uploadPromises);
+              await completeUpload(uploadStateRef.current.uploadId, uploadStateRef.current.key, uploadStateRef.current.parts.sort((a, b) => a.PartNumber - b.PartNumber));
+              setRecordingStatus('success');
+            } catch (err) { setError("최종 저장 실패"); setRecordingStatus('idle'); }
+          };
+          recorder.start(3000);
+          mediaRecorderRef.current = recorder;
+          setIsRecording(true);
+          setRecordingStatus('recording');
+          if (viewerUrlFromStream) setViewerUrl(viewerUrlFromStream);
+        });
+      }).catch((err) => setError(err?.message || '미디어 장치 오류'));
+    }).catch((err) => setError(err?.message || '업로드 초기화 실패'));
+  };
+
+  const doStartStreamingOnly = (viewerUrlFromStream) => {
+    const videoConstraints = { width: { ideal: 1280 }, height: { ideal: 720 } };
+    navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: true }).then((screenStream) => {
+      const videoTrack = screenStream.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.applyConstraints({ width: { ideal: 1280 }, height: { ideal: 720 } }).catch(() => {});
+      }
+      return navigator.mediaDevices.getUserMedia({ audio: true }).then((micStream) => {
+        const combinedStream = new MediaStream([...screenStream.getVideoTracks(), ...micStream.getAudioTracks()]);
+        if (videoPreviewRef.current) videoPreviewRef.current.srcObject = combinedStream;
+        const recorder = new MediaRecorder(combinedStream, {
+          mimeType: 'video/webm; codecs=vp9,opus',
+          videoBitsPerSecond: 1_500_000,
+          audioBitsPerSecond: 128_000,
+        });
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            const ws = streamWsRef.current;
+            if (ws?.readyState === WebSocket.OPEN) {
+              event.data.arrayBuffer().then((ab) => { try { ws.send(ab); } catch {} });
+            }
+          }
+        };
+        recorder.onstop = () => {
+          streamRetryActiveRef.current = false;
+          if (streamWsRetryTimerRef.current) {
+            clearTimeout(streamWsRetryTimerRef.current);
+            streamWsRetryTimerRef.current = null;
+          }
+          combinedStream.getTracks().forEach(t => t.stop());
+          setLiveStreamReady(false);
+          setViewerUrl('');
+          setStreamDisconnectedReason(null);
+          const ws = streamWsRef.current;
+          if (ws) {
+            try { ws.close(); } catch {}
+            streamWsRef.current = null;
+          }
+          setIsRecording(false);
+          setRecordingStatus('idle');
+        };
+        recorder.start(3000);
+        mediaRecorderRef.current = recorder;
+        setIsRecording(true);
+        setRecordingStatus('recording');
+        if (viewerUrlFromStream) setViewerUrl(viewerUrlFromStream);
+      });
+    }).catch((err) => setError(err?.message || '미디어 장치 오류'));
+  };
+
   const startStreaming = async () => {
-    if (!s3Config.bucketName || !s3Config.accessKeyId || !s3Config.secretAccessKey) {
-      setError("S3 설정을 먼저 완료해주세요.");
+    setError(null);
+    setLiveStreamError(null);
+    setStreamDisconnectedReason(null);
+    setReplaceStreamModal(false);
+    setRecordOnlyConfirmModal(false);
+    setStreamOnlyConfirmModal(false);
+    const serverUrl = s3Config.streamServerUrl?.trim();
+    const hasS3 = !!(s3Config.bucketName && s3Config.accessKeyId && s3Config.secretAccessKey);
+
+    if (!hasS3 && !serverUrl) {
+      setError("S3 설정 또는 스트리밍 서버 URL을 입력해주세요.");
+      return;
+    }
+    if (!hasS3 && serverUrl) {
+      setStreamOnlyConfirmModal(true);
+      return;
+    }
+    if (!hasS3) return;
+
+    try {
+      if (serverUrl) {
+        streamRetryActiveRef.current = true;
+        const result = await connectAndRequestStart(serverUrl);
+        if (result.replace) {
+          setReplaceStreamModal(true);
+          return;
+        }
+        if (result.error) {
+          streamRetryActiveRef.current = false;
+          setRecordOnlyConfirmModal(true);
+          return;
+        }
+        doStartRecording(result.viewerUrl);
+      } else {
+        doStartRecording('');
+      }
+    } catch (err) {
+      setError(err?.message || '방송 시작 실패');
+    }
+  };
+
+  const confirmRecordOnly = () => {
+    setRecordOnlyConfirmModal(false);
+    streamRetryActiveRef.current = false;
+    doStartRecording('');
+  };
+
+  const confirmStreamOnly = async () => {
+    setStreamOnlyConfirmModal(false);
+    const serverUrl = s3Config.streamServerUrl?.trim();
+    if (!serverUrl) {
+      setError("스트리밍 서버 URL이 없습니다.");
       return;
     }
     try {
-      setError(null);
-      setLiveStreamError(null);
-      if (streamWsRef.current) {
-        streamWsRef.current.close();
-        streamWsRef.current = null;
+      streamRetryActiveRef.current = true;
+      const result = await connectAndRequestStart(serverUrl);
+      if (result.replace) {
+        setReplaceStreamModal(true);
+        return;
       }
-      if (s3Config.streamServerUrl?.trim()) {
-        streamRetryActiveRef.current = true;
-        connectStreamServer(s3Config.streamServerUrl);
-      }
-      const fileName = `${getFormattedDate()}.webm`;
-      setSavedKey(fileName);
-      const { UploadId } = await initMultipartUpload(fileName);
-      uploadStateRef.current = { uploadId: UploadId, key: fileName, parts: [], partNumber: 1, buffer: [], bufferSize: 0, uploadPromises: [] };
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const combinedStream = new MediaStream([...screenStream.getVideoTracks(), ...micStream.getAudioTracks()]);
-      if (videoPreviewRef.current) videoPreviewRef.current.srcObject = combinedStream;
-      const recorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm; codecs=vp9,opus' });
-      pendingWsSendsRef.current = Promise.resolve();
-      const flushBuffer = async (isLastPart = false) => {
-        const state = uploadStateRef.current;
-        if (state.buffer.length === 0) return;
-        const totalSize = state.buffer.reduce((s, c) => s + c.byteLength, 0);
-        if (!isLastPart && totalSize < MIN_PART_SIZE) return;
-        const chunks = state.buffer;
-        state.buffer = [];
-        state.bufferSize = 0;
-        const num = state.partNumber++;
-        setUploadProgress(prev => ({ ...prev, currentPart: num }));
-        const combined = new Uint8Array(totalSize);
-        let offset = 0;
-        for (const c of chunks) { combined.set(new Uint8Array(c), offset); offset += c.byteLength; }
-        const p = uploadPart(combined, num, state.uploadId, state.key)
-          .then(({ ETag }) => { state.parts.push({ ETag, PartNumber: num }); setUploadProgress(prev => ({ ...prev, totalSent: prev.totalSent + combined.byteLength })); })
-          .catch((err) => setError(`업로드 실패: ${err.message}`));
-        state.uploadPromises.push(p);
-      };
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          const sendTask = (async () => {
-            const state = uploadStateRef.current;
-            const ab = await event.data.arrayBuffer();
-            state.buffer.push(ab);
-            state.bufferSize += event.data.size;
-            const ws = streamWsRef.current;
-            if (ws?.readyState === WebSocket.OPEN) {
-              try { ws.send(ab); } catch {}
-            }
-            if (state.bufferSize >= MIN_PART_SIZE) await flushBuffer(false);
-          })();
-          pendingWsSendsRef.current = pendingWsSendsRef.current.then(() => sendTask);
-        }
-      };
-      recorder.onstop = async () => {
-        setRecordingStatus('processing');
+      if (result.error) {
+        setError(result.error === 'connection_failed' ? '스트리밍 서버 연결에 실패했습니다.' : `스트리밍: ${result.error}`);
         streamRetryActiveRef.current = false;
-        if (streamWsRetryTimerRef.current) {
-          clearTimeout(streamWsRetryTimerRef.current);
-          streamWsRetryTimerRef.current = null;
-        }
-        combinedStream.getTracks().forEach(t => t.stop());
-        setLiveStreamReady(false);
-        setViewerUrl('');
-        const ws = streamWsRef.current;
-        if (ws) {
-          try {
-            await pendingWsSendsRef.current;
-            ws.close();
-          } catch {}
-          streamWsRef.current = null;
-        }
-        try {
-          await flushBuffer(true);
-          await Promise.all(uploadStateRef.current.uploadPromises);
-          await completeUpload(uploadStateRef.current.uploadId, uploadStateRef.current.key, uploadStateRef.current.parts.sort((a, b) => a.PartNumber - b.PartNumber));
-          setRecordingStatus('success');
-        } catch (err) { setError("최종 저장 실패"); setRecordingStatus('idle'); }
-      };
-      recorder.start(5000); 
-      mediaRecorderRef.current = recorder;
-      setIsRecording(true);
-      setRecordingStatus('recording');
-    } catch (err) { setError(err.message); }
+        return;
+      }
+      doStartStreamingOnly(result.viewerUrl);
+    } catch (err) {
+      setError(err?.message || '송출 시작 실패');
+      streamRetryActiveRef.current = false;
+    }
+  };
+
+  const confirmForceReplace = async () => {
+    setForceReplaceConfirmModal(false);
+    const serverUrl = s3Config.streamServerUrl?.trim();
+    const hasS3 = !!(s3Config.bucketName && s3Config.accessKeyId && s3Config.secretAccessKey);
+    if (!serverUrl) {
+      setError("스트리밍 서버 URL을 입력해주세요.");
+      return;
+    }
+    if (!hasS3) {
+      setError("기존 방송 끊고 시작하려면 S3 설정이 필요합니다.");
+      return;
+    }
+    try {
+      streamRetryActiveRef.current = true;
+      const result = await connectAndForceReplace(serverUrl);
+      if (result.error) {
+        streamRetryActiveRef.current = false;
+        setError(result.error === 'connection_failed' ? '스트리밍 서버 연결에 실패했습니다.' : `스트리밍: ${result.error}`);
+        return;
+      }
+      doStartRecording(result.viewerUrl);
+    } catch (err) {
+      setError(err?.message || '방송 시작 실패');
+      streamRetryActiveRef.current = false;
+    }
+  };
+
+  const confirmReplaceStream = () => {
+    const ws = streamWsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setReplaceStreamModal(false);
+      setLiveStreamError('연결이 끊겼습니다. 방송 시작을 다시 시도해주세요.');
+      return;
+    }
+    onStreamStartOkRef.current = (viewerUrl) => doStartRecording(viewerUrl);
+    ws.send(JSON.stringify({ type: 'start_replace' }));
+    setReplaceStreamModal(false);
+  };
+
+  const cancelReplaceStream = () => {
+    const ws = streamWsRef.current;
+    if (ws) {
+      try { ws.close(); } catch {}
+      streamWsRef.current = null;
+    }
+    onStreamStartOkRef.current = null;
+    setReplaceStreamModal(false);
   };
 
   const stopStreaming = () => {
@@ -381,6 +763,78 @@ const App = () => {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
+      {/* 기존 방송 끊고 새 방송 시작 확인 모달 */}
+      {replaceStreamModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-sm rounded-3xl p-8 shadow-2xl space-y-6">
+            <h3 className="text-xl font-bold text-amber-400">기존 방송이 있습니다</h3>
+            <p className="text-slate-300 text-sm">다른 탭/기기에서 이미 방송 중입니다. 끊고 이 화면에서 새 방송을 시작할까요?</p>
+            <div className="flex gap-3">
+              <button onClick={cancelReplaceStream} className="flex-1 py-3 rounded-xl font-bold bg-slate-700 hover:bg-slate-600 text-slate-200 transition-all active:scale-95">
+                취소
+              </button>
+              <button onClick={confirmReplaceStream} className="flex-1 py-3 rounded-xl font-bold bg-amber-600 hover:bg-amber-500 text-white transition-all active:scale-95">
+                새 방송 시작
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 스트리밍 서버 접속 실패 → 녹화만 진행 확인 모달 */}
+      {recordOnlyConfirmModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-sm rounded-3xl p-8 shadow-2xl space-y-6">
+            <h3 className="text-xl font-bold text-amber-400">스트리밍 서버에 연결할 수 없습니다</h3>
+            <p className="text-slate-300 text-sm">녹화만 진행할까요? (S3에 저장되며, 라이브 송출은 되지 않습니다.)</p>
+            <div className="flex gap-3">
+              <button onClick={() => setRecordOnlyConfirmModal(false)} className="flex-1 py-3 rounded-xl font-bold bg-slate-700 hover:bg-slate-600 text-slate-200 transition-all active:scale-95">
+                취소
+              </button>
+              <button onClick={confirmRecordOnly} className="flex-1 py-3 rounded-xl font-bold bg-amber-600 hover:bg-amber-500 text-white transition-all active:scale-95">
+                녹화만 진행
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* S3 미연결 → 송출만 진행 확인 모달 */}
+      {streamOnlyConfirmModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-sm rounded-3xl p-8 shadow-2xl space-y-6">
+            <h3 className="text-xl font-bold text-amber-400">S3에 연결되지 않았습니다</h3>
+            <p className="text-slate-300 text-sm">라이브 송출만 진행할까요? (녹화 파일은 저장되지 않습니다.)</p>
+            <div className="flex gap-3">
+              <button onClick={() => setStreamOnlyConfirmModal(false)} className="flex-1 py-3 rounded-xl font-bold bg-slate-700 hover:bg-slate-600 text-slate-200 transition-all active:scale-95">
+                취소
+              </button>
+              <button onClick={confirmStreamOnly} className="flex-1 py-3 rounded-xl font-bold bg-amber-600 hover:bg-amber-500 text-white transition-all active:scale-95">
+                송출만 진행
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 기존 방송 강제 해제 후 새로 시작 확인 모달 */}
+      {forceReplaceConfirmModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-sm rounded-3xl p-8 shadow-2xl space-y-6">
+            <h3 className="text-xl font-bold text-amber-400">기존 방송을 끊고 시작할까요?</h3>
+            <p className="text-slate-300 text-sm">연결된 기존 방송을 강제로 해제하고 이 기기에서 새 방송을 시작합니다.</p>
+            <div className="flex gap-3">
+              <button onClick={() => setForceReplaceConfirmModal(false)} className="flex-1 py-3 rounded-xl font-bold bg-slate-700 hover:bg-slate-600 text-slate-200 transition-all active:scale-95">
+                취소
+              </button>
+              <button onClick={confirmForceReplace} className="flex-1 py-3 rounded-xl font-bold bg-amber-600 hover:bg-amber-500 text-white transition-all active:scale-95">
+                시작
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Crypto Modal */}
       {cryptoModal.show && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -439,10 +893,17 @@ const App = () => {
               <div className="aspect-video bg-black rounded-3xl border border-slate-800 overflow-hidden relative shadow-2xl">
                 <video ref={videoPreviewRef} autoPlay muted className="w-full h-full object-contain" />
                 {isRecording && (
-                  <div className="absolute top-6 right-6 flex gap-2">
-                    <div className="bg-red-600 px-4 py-1.5 rounded-full text-xs font-black flex items-center gap-2 shadow-lg animate-pulse">LIVE</div>
-                    {s3Config.streamServerUrl?.trim() && liveStreamReady && (
-                      <div className="bg-amber-600 px-4 py-1.5 rounded-full text-xs font-black flex items-center gap-2 shadow-lg">라이브 송출중</div>
+                  <div className="absolute top-6 right-6 flex flex-col items-end gap-2">
+                    <div className="flex gap-2">
+                      <div className="bg-red-600 px-4 py-1.5 rounded-full text-xs font-black flex items-center gap-2 shadow-lg animate-pulse">LIVE</div>
+                      {s3Config.streamServerUrl?.trim() && liveStreamReady && (
+                        <div className="bg-amber-600 px-4 py-1.5 rounded-full text-xs font-black flex items-center gap-2 shadow-lg">라이브 송출중</div>
+                      )}
+                    </div>
+                    {streamDisconnectedReason === 'replaced_by_new_stream' && (
+                      <div className="bg-slate-800/95 text-amber-400 px-4 py-2 rounded-lg text-xs font-bold shadow-lg border border-amber-500/50">
+                        다른 방송으로 대체되어 라이브 송출이 끊겼습니다. 녹화는 계속됩니다.
+                      </div>
                     )}
                   </div>
                 )}
@@ -475,9 +936,16 @@ const App = () => {
                     <StopCircle size={20} /> 방송 종료 및 저장
                   </button>
                 ) : (
-                  <button onClick={startStreaming} disabled={recordingStatus === 'processing'} className="bg-blue-600 hover:bg-blue-700 px-8 py-3 rounded-xl font-bold flex items-center gap-2 transition-transform active:scale-95">
-                    <Mic size={20} /> 방송 시작하기
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <button onClick={startStreaming} disabled={recordingStatus === 'processing'} className="bg-blue-600 hover:bg-blue-700 px-8 py-3 rounded-xl font-bold flex items-center gap-2 transition-transform active:scale-95">
+                      <Mic size={20} /> 방송 시작하기
+                    </button>
+                    {s3Config.streamServerUrl?.trim() && (
+                      <button onClick={() => setForceReplaceConfirmModal(true)} disabled={recordingStatus === 'processing'} className="bg-slate-700 hover:bg-amber-600 px-6 py-3 rounded-xl font-bold text-sm transition-transform active:scale-95 border border-slate-600">
+                        기존 방송 끊고 시작
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
