@@ -5,120 +5,13 @@
  */
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { dirname } from 'path';
-import { fileURLToPath } from 'url';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3030;
 
-const VIEWER_HTML = `<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>라이브 시청 - S3 Video Recorder</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem; }
-    h1 { font-size: 1.25rem; margin-bottom: 1rem; color: #94a3b8; }
-    .player-wrap { width: 100%; max-width: 960px; aspect-ratio: 16/9; background: #000; border-radius: 1rem; overflow: hidden; }
-    video { width: 100%; height: 100%; object-fit: contain; }
-    .status { margin-top: 1rem; padding: 0.75rem 1rem; background: #1e293b; border-radius: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
-    .status.live { color: #22c55e; }
-    .status.waiting { color: #f59e0b; }
-  </style>
-</head>
-<body>
-  <h1>라이브 스트림 (WebM)</h1>
-  <div class="player-wrap">
-    <video id="video" controls muted playsinline></video>
-  </div>
-  <div id="status" class="status waiting">스트림 대기 중...</div>
-  <script>
-    const video = document.getElementById('video');
-    const statusEl = document.getElementById('status');
-    const mime = 'video/webm; codecs="vp9,opus"';
-    if (!MediaSource.isTypeSupported(mime)) {
-      statusEl.textContent = '이 브라우저는 WebM VP9 재생을 지원하지 않습니다.';
-      statusEl.className = 'status';
-    } else {
-      const mediaSource = new MediaSource();
-      video.src = URL.createObjectURL(mediaSource);
-      let sourceBuffer = null;
-      const chunkQueue = [];
-      let connecting = true;
-
-      function appendNext() {
-        if (!sourceBuffer || sourceBuffer.updating || chunkQueue.length === 0) return;
-        const chunk = chunkQueue.shift();
-        try {
-          sourceBuffer.appendBuffer(chunk);
-        } catch (e) {
-          console.warn('appendBuffer error', e);
-          appendNext();
-        }
-      }
-
-      mediaSource.addEventListener('sourceopen', () => {
-        try {
-          sourceBuffer = mediaSource.addSourceBuffer(mime);
-          sourceBuffer.addEventListener('updateend', appendNext);
-          statusEl.textContent = 'LIVE';
-          statusEl.className = 'status live';
-          video.play().catch(() => {});
-          appendNext();
-        } catch (e) {
-          statusEl.textContent = 'SourceBuffer 오류: ' + e.message;
-        }
-      });
-
-      const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(wsScheme + '//' + location.host);
-      ws.binaryType = 'arraybuffer';
-      ws.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer && e.data.byteLength > 0) {
-          chunkQueue.push(e.data);
-          appendNext();
-        }
-      };
-      ws.onopen = () => { connecting = false; };
-      ws.onerror = () => {
-        if (connecting) statusEl.textContent = '서버 연결 실패. 방송이 시작되면 자동으로 재연결합니다.';
-      };
-      ws.onclose = () => {
-        if (document.hasFocus()) setTimeout(() => location.reload(), 3000);
-      };
-    }
-  </script>
-</body>
-</html>`;
-
-const server = createServer((req, res) => {
-  try {
-    const url = req.url === '/' ? '/index.html' : req.url;
-    if (url === '/index.html' || url === '/') {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(VIEWER_HTML);
-      return;
-    }
-    if (url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', service: 'stream-host' }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
-  } catch (err) {
-    console.error('HTTP handler error:', err);
-    try {
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-      }
-      res.end(JSON.stringify({ error: 'internal_server_error' }));
-    } catch {
-      // ignore secondary errors
-    }
-  }
+// WebSocket만 사용. HTTP는 포트 리스너용 최소 핸들러만 유지 (Upgrade는 ws가 처리)
+const server = createServer((_req, res) => {
+  res.writeHead(404);
+  res.end();
 });
 
 const wss = new WebSocketServer({ server });

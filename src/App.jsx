@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Camera, Mic, StopCircle, Settings, CheckCircle, AlertCircle, Play, Radio, MonitorPlay, Eye, Download, RefreshCw, FileVideo, Lock, Unlock, X, Share, CircleArrowOutDownLeft } from 'lucide-react';
+import { Camera, Mic, StopCircle, Settings, CheckCircle, AlertCircle, Radio, MonitorPlay, Eye, Lock, Unlock, X, Share, CircleArrowOutDownLeft } from 'lucide-react';
 import {
   S3Client,
   CreateMultipartUploadCommand,
@@ -40,11 +40,11 @@ const App = () => {
   // 암호화 모달 상태
   const [cryptoModal, setCryptoModal] = useState({ show: false, mode: 'export', password: '', fileData: null });
 
-  // 시청 및 목록 상태
-  const [fileList, setFileList] = useState([]);
-  const [isLoadingList, setIsLoadingList] = useState(false);
-  const [viewUrl, setViewUrl] = useState("");
-  const [activePlayKey, setActivePlayKey] = useState("");
+  // 시청(라이브) 상태: WS/WSS URL로 방송 연결
+  const [liveViewUrl, setLiveViewUrl] = useState('ws://localhost:3030');
+  const [liveViewStatus, setLiveViewStatus] = useState('idle'); // idle | connecting | live | error
+  const [liveViewError, setLiveViewError] = useState('');
+  const [streamLinkCopied, setStreamLinkCopied] = useState(false);
 
   const mediaRecorderRef = useRef(null);
   const videoPreviewRef = useRef(null);
@@ -53,6 +53,11 @@ const App = () => {
   const streamRetryActiveRef = useRef(false);
   const pendingWsSendsRef = useRef(Promise.resolve());
   const onStreamStartOkRef = useRef(null);
+  const liveViewVideoRef = useRef(null);
+  const liveViewWsRef = useRef(null);
+  const liveViewMediaSourceRef = useRef(null);
+  const liveViewSourceBufferRef = useRef(null);
+  const liveViewChunkQueueRef = useRef([]);
   const uploadStateRef = useRef({
     uploadId: null,
     key: null,
@@ -759,7 +764,137 @@ const App = () => {
     } catch (err) { return ""; }
   };
 
-  useEffect(() => { if (currentView === 'view') fetchFileList(); }, [currentView]);
+  const appendNextLiveView = () => {
+    const sb = liveViewSourceBufferRef.current;
+    const queue = liveViewChunkQueueRef.current;
+    if (!sb || sb.updating || queue.length === 0) return;
+    const chunk = queue.shift();
+    try {
+      sb.appendBuffer(chunk);
+    } catch (e) {
+      console.warn('appendBuffer error', e);
+      appendNextLiveView();
+    }
+  };
+
+  const connectLiveView = (urlOverride) => {
+    const url = (urlOverride ?? liveViewUrl)?.trim();
+    if (!url || (!url.startsWith('ws://') && !url.startsWith('wss://'))) {
+      setLiveViewError('ws:// 또는 wss:// URL을 입력하세요.');
+      setLiveViewStatus('error');
+      return;
+    }
+    setLiveViewError('');
+    setLiveViewStatus('connecting');
+    liveViewChunkQueueRef.current = [];
+
+    const prevWs = liveViewWsRef.current;
+    if (prevWs) {
+      try { prevWs.close(); } catch {}
+      liveViewWsRef.current = null;
+    }
+
+    const mime = 'video/webm; codecs="vp9,opus"';
+    if (!MediaSource.isTypeSupported(mime)) {
+      setLiveViewError('이 브라우저는 WebM VP9 재생을 지원하지 않습니다.');
+      setLiveViewStatus('error');
+      return;
+    }
+
+    const mediaSource = new MediaSource();
+    liveViewMediaSourceRef.current = mediaSource;
+    const videoEl = liveViewVideoRef.current;
+    if (videoEl) {
+      videoEl.src = URL.createObjectURL(mediaSource);
+    }
+
+    mediaSource.addEventListener('sourceopen', () => {
+      try {
+        const sb = mediaSource.addSourceBuffer(mime);
+        liveViewSourceBufferRef.current = sb;
+        sb.addEventListener('updateend', appendNextLiveView);
+        setLiveViewStatus('live');
+        if (videoEl) videoEl.play().catch(() => {});
+        appendNextLiveView();
+      } catch (e) {
+        setLiveViewError('SourceBuffer 오류: ' + e.message);
+        setLiveViewStatus('error');
+      }
+    });
+
+    const ws = new WebSocket(url);
+    liveViewWsRef.current = ws;
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer && e.data.byteLength > 0) {
+        liveViewChunkQueueRef.current.push(e.data);
+        appendNextLiveView();
+      }
+    };
+    ws.onopen = () => setLiveViewStatus('live');
+    ws.onerror = () => {
+      setLiveViewError('서버 연결 실패. 방송 중인지 확인하세요.');
+      setLiveViewStatus('error');
+    };
+    ws.onclose = () => {
+      liveViewWsRef.current = null;
+      setLiveViewStatus('idle');
+    };
+  };
+
+  const disconnectLiveView = () => {
+    const ws = liveViewWsRef.current;
+    if (ws) {
+      try { ws.close(); } catch {}
+      liveViewWsRef.current = null;
+    }
+    liveViewSourceBufferRef.current = null;
+    liveViewMediaSourceRef.current = null;
+    liveViewChunkQueueRef.current = [];
+    const videoEl = liveViewVideoRef.current;
+    if (videoEl) videoEl.src = '';
+    setLiveViewStatus('idle');
+    setLiveViewError('');
+  };
+
+  const getShareableStreamUrl = () => {
+    const base = typeof window !== 'undefined' ? `${window.location.origin}${window.location.pathname}` : '';
+    const url = liveViewUrl?.trim() || '';
+    if (!url) return base;
+    try {
+      const encoded = typeof btoa !== 'undefined' ? btoa(unescape(encodeURIComponent(url))) : '';
+      return encoded ? `${base}?stream=${encoded}` : base;
+    } catch {
+      return base;
+    }
+  };
+
+  const copyStreamLink = () => {
+    const link = getShareableStreamUrl();
+    if (!link || link === (typeof window !== 'undefined' ? window.location.origin + window.location.pathname : '')) return;
+    navigator.clipboard?.writeText(link).then(() => {
+      setStreamLinkCopied(true);
+      setError(null);
+      setTimeout(() => setStreamLinkCopied(false), 2000);
+    }).catch(() => setError('링크 복사 실패'));
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const stream = params.get('stream');
+    if (stream) {
+      try {
+        const decoded = typeof atob !== 'undefined' ? decodeURIComponent(escape(atob(stream))) : '';
+        if (decoded.startsWith('ws://') || decoded.startsWith('wss://')) {
+          setLiveViewUrl(decoded);
+          setCurrentView('view');
+          setTimeout(() => connectLiveView(decoded), 0);
+        }
+      } catch {
+        // ignore invalid base64 or param
+      }
+    }
+  }, []);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
@@ -993,42 +1128,67 @@ const App = () => {
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
             <div className="lg:col-span-2 space-y-6">
               <div className="aspect-video bg-black rounded-3xl border border-slate-800 overflow-hidden shadow-2xl relative">
-                {viewUrl ? <video key={viewUrl} src={viewUrl} controls autoPlay className="w-full h-full object-contain" /> : <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-700"><Play size={80} className="mb-4 opacity-10" /><p>목록에서 영상을 선택하세요</p></div>}
-              </div>
-              {activePlayKey && (
-                <div className="p-4 bg-slate-900 rounded-2xl border border-slate-800 flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <FileVideo className="text-blue-500" />
-                    <div><p className="text-sm font-bold truncate max-w-xs">{activePlayKey}</p><p className="text-[10px] text-slate-500 uppercase tracking-widest">Now Playing</p></div>
-                  </div>
-                  <button onClick={async () => { const url = await getFileUrl(activePlayKey, true); if (url) window.open(url); }} className="bg-slate-800 hover:bg-slate-700 p-2 rounded-lg transition-colors"><Download size={20} /></button>
-                </div>
-              )}
-            </div>
-            <div className="space-y-4">
-              <div className="flex items-center justify-between px-2">
-                <h3 className="font-bold flex items-center gap-2"><Eye size={18} className="text-blue-500" /> 녹화 목록</h3>
-                <button onClick={fetchFileList} className="p-2 hover:bg-slate-800 rounded-full transition-colors text-slate-400 hover:text-white"><RefreshCw size={16} className={isLoadingList ? 'animate-spin' : ''} /></button>
-              </div>
-              <div className="bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden max-h-[600px] overflow-y-auto custom-scrollbar">
-                {fileList.length === 0 ? <div className="p-12 text-center text-slate-600"><FileVideo size={48} className="mx-auto mb-2 opacity-10" /><p className="text-sm">저장된 영상이 없습니다.</p></div> : (
-                  <div className="divide-y divide-slate-800">
-                    {fileList.map((file) => (
-                      <div key={file.Key} className={`p-4 hover:bg-slate-800/50 transition-colors group ${activePlayKey === file.Key ? 'bg-blue-900/10 border-l-4 border-l-blue-500' : ''}`}>
-                        <div className="flex flex-col gap-2">
-                          <p className="text-sm font-medium truncate text-slate-300">{file.Key}</p>
-                          <div className="flex items-center justify-between">
-                            <span className="text-[10px] text-slate-500">{(file.Size / 1024 / 1024).toFixed(2)} MB</span>
-                            <div className="flex gap-2">
-                              <button onClick={async () => { const url = await getFileUrl(file.Key); if (url) { setViewUrl(url); setActivePlayKey(file.Key); } }} className="text-[10px] font-bold bg-blue-600/20 text-blue-400 px-2 py-1 rounded hover:bg-blue-600 hover:text-white transition-all">재생</button>
-                              <button onClick={async () => { const url = await getFileUrl(file.Key, true); if (url) window.open(url); }} className="text-[10px] font-bold bg-slate-800 text-slate-400 px-2 py-1 rounded hover:bg-slate-700 hover:text-white transition-all">다운로드</button>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
+                <video ref={liveViewVideoRef} controls muted playsInline className="w-full h-full object-contain" />
+                {liveViewStatus === 'idle' && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-600 bg-slate-950/80">
+                    <Radio size={64} className="mb-4 opacity-30" />
+                    <p className="text-sm">스트리밍 서버 URL을 입력하고 연결하세요</p>
                   </div>
                 )}
+              </div>
+              <div className={`p-4 rounded-2xl border flex items-center justify-between gap-4 ${
+                liveViewStatus === 'live' ? 'bg-slate-900 border-green-600/50' : 'bg-slate-900 border-slate-800'
+              }`}>
+                <span className={`text-sm font-medium ${liveViewStatus === 'live' ? 'text-green-400' : 'text-slate-400'}`}>
+                  {liveViewStatus === 'idle' && '대기 중'}
+                  {liveViewStatus === 'connecting' && '연결 중…'}
+                  {liveViewStatus === 'live' && 'LIVE'}
+                  {liveViewStatus === 'error' && liveViewError}
+                </span>
+                {liveViewStatus === 'live' && (
+                  <button onClick={disconnectLiveView} className="shrink-0 bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded-lg text-sm font-bold">연결 끊기</button>
+                )}
+              </div>
+            </div>
+            <div className="space-y-4">
+              <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800">
+                <h3 className="font-bold flex items-center gap-2 text-blue-400 mb-4"><Eye size={18} /> 라이브 시청</h3>
+                <p className="text-xs text-slate-500 mb-3">방송 중인 스트리밍 서버의 WS 또는 WSS URL을 입력하세요.</p>
+                <div className="space-y-3">
+                  <label className="block text-[10px] uppercase font-black text-slate-500">스트리밍 서버 URL (ws / wss)</label>
+                  <input
+                    type="text"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm font-mono focus:border-blue-500 outline-none transition-colors"
+                    placeholder="ws://localhost:3030"
+                    value={liveViewUrl}
+                    onChange={(e) => setLiveViewUrl(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && connectLiveView()}
+                  />
+                  <div className="flex gap-2 flex-wrap">
+                    <button
+                      onClick={() => connectLiveView()}
+                      disabled={liveViewStatus === 'connecting'}
+                      className="flex-1 min-w-0 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 px-4 py-3 rounded-lg font-bold text-sm transition-colors"
+                    >
+                      {liveViewStatus === 'connecting' ? '연결 중…' : '연결'}
+                    </button>
+                    {(liveViewStatus === 'live' || liveViewStatus === 'error') && (
+                      <button onClick={disconnectLiveView} className="px-4 py-3 rounded-lg font-bold text-sm bg-slate-700 hover:bg-slate-600 transition-colors">
+                        끊기
+                      </button>
+                    )}
+                    {liveViewUrl?.trim() && (
+                      <button
+                        onClick={copyStreamLink}
+                        className="flex items-center gap-2 px-4 py-3 rounded-lg font-bold text-sm bg-slate-700 hover:bg-slate-600 transition-colors"
+                        title="시청 링크 복사 (쿼리 파라미터 포함)"
+                      >
+                        <Share size={16} />
+                        {streamLinkCopied ? '복사됨' : '공유'}
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           </div>
