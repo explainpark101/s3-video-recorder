@@ -46,7 +46,7 @@ function sendToViewers(data, isBinary) {
 }
 
 wss.on('connection', (ws) => {
-  viewerSockets.add(ws);
+  // init + 버퍼를 먼저 보낸 뒤 viewerSockets에 넣어야, 라이브 청크가 버퍼 뒤에만 도착함 (중도 참여자 재생 연속성)
   if (initChunk) {
     try {
       if (ws.readyState === ws.OPEN) {
@@ -60,6 +60,7 @@ wss.on('connection', (ws) => {
       // ignore
     }
   }
+  viewerSockets.add(ws);
 
   let isInitialized = false;
   let inactivityTimer = null;
