@@ -165,9 +165,13 @@ wss.on('connection', (ws) => {
 
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
       lastChunkAt = Date.now();
-      if (!initChunk) initChunk = buf;
-      chunkBuffer.push(buf);
-      if (chunkBuffer.length > MAX_CHUNK_BUFFER) chunkBuffer.shift();
+      if (!initChunk) {
+        initChunk = buf;
+        // Init segment만 보관. chunkBuffer에는 미디어 클러스터만 넣어서, 새 시청자에게 init + 버퍼 전달 시 init 중복·타임코드 역전 방지
+      } else {
+        chunkBuffer.push(buf);
+        if (chunkBuffer.length > MAX_CHUNK_BUFFER) chunkBuffer.shift();
+      }
       sendToViewers(buf, true);
     } catch (outerErr) {
       console.error('WebSocket message handler error:', outerErr);
